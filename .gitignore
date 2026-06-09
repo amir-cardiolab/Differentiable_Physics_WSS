@@ -1,0 +1,33 @@
+# ----- Data bundle (hosted externally, not committed) -----
+WSS_PINNs_Diff_Data/
+# Input data folders (downloaded from the external link, placed next to scripts)
+2D-BFS/Results_BFS_InletBC_small/
+Coronary Artery/CFD_Data/
+Coronary Artery/Coronary_Mesh/
+Coronary Artery/Forward_CFD/
+Coronary Artery/Coronary_Mask.vtk
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# ----- Generated outputs (training / inverse runs) -----
+# 2D-BFS
+2D-BFS/Runs/
+2D-BFS/Inverse_Results_*/
+
+# Coronary Artery PINN outputs
+Coronary Artery/WEIGHTS_pre/
+Coronary Artery/Loss_pre/
+Coronary Artery/Results_pre/
+
+# Coronary Artery inverse-solver outputs
+Coronary Artery/Inverse_*/
+
+# ----- OS / editor cruft -----
+.DS_Store
+*.swp
