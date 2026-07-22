@@ -8,7 +8,7 @@ Inverse reconstruction of velocity, pressure, concentration transport and
 | Script | Method | Reads | Writes |
 |--------|--------|-------|--------|
 | [`PINNs.py`](PINNs.py) | Physics-Informed NN (PyTorch) | `CFD_Data/` (`Data_*.vtk`, `Wall.vtk`, `Full_Domain.vtk`) | `WEIGHTS_pre/`, `Loss_pre/`, `Results_pre/` |
-| [`Diff_Physics.py`](Diff_Physics.py) | Adjoint inverse (FEniCS + dolfin-adjoint) | `Coronary_Mesh/` (mesh) + `Forward_CFD/` (observations) + `Coronary_Mask.vtk` | `Inverse_TwoOutlet_1K_HardConstraint/` |
+| [`Diff_Physics.py`](Diff_Physics.py) | Adjoint inverse (FEniCS + dolfin-adjoint) | `Coronary_Mesh/` (mesh) + `Forward_CFD/` (observations) + `Coronary_Mask.vtk` | `Inverse_Results/` |
 
 ## Data folders
 
