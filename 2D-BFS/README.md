@@ -32,7 +32,7 @@ Defaults currently differ by design (PINN: `[0.0, 0.1]`; inverse: `[0.3, 0.4]`)
 — set them to the same band when you want the two methods to see identical
 observations.
 
-## Data folder: `Results_BFS_InletBC_small/`
+## Data folder: `Results_BFS/`
 
 The data bundle is **pruned to only the files actually used**. Contents:
 
