@@ -31,7 +31,7 @@ see [Data](#data) below.
 ├── 2D-BFS/                       # 2-D backward-facing-step case
 │   ├── PINN.py                   # PINN reconstruction
 │   ├── Diff_Physics.py           # adjoint/differentiable-physics inverse (FEniCS)
-│   └── Results_BFS_InletBC_small/   # ← input data (from the data bundle)
+│   └── Results_BFS/   # ← input data (from the data bundle)
 └── Coronary Artery/              # 3-D coronary-artery case
     ├── PINNs.py                  # PINN reconstruction
     ├── Diff_Physics.py           # adjoint/differentiable-physics inverse (FEniCS)
