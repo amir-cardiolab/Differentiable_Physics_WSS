@@ -33,14 +33,12 @@ Flag_schedule = True
 # Your fixed default values
 Lambda_bc = 100
 Lambda_data = 200000
-Lambda_data_2 = 200000
 Lambda_eq = 10
 Lambda_con = 25
 Lambda_x = Lambda_eq
 Lambda_z = Lambda_eq
 Lambda_y = Lambda_eq
 Lambda_adv = 10
-Lambda_adv_2 = 10
 # ------------------------------------------------------------------
 # alpha: weight multiplier for physics losses on the FULL domain
 #   alpha = 0  ->  only physics inside the data domain is penalised
@@ -69,7 +67,6 @@ Y_scale = 1.1
 P_scale = 1
 T_scale = 0.9
 U_scale = 225
-D_scale = 0.9
 std = 0.1
 num_frequencies = 10
 L_scale = 0.9
@@ -77,28 +74,27 @@ Re = U_scale*L_scale/dyn_vis
 Pe = L_scale*U_scale/Diff
 inv_Re = 1/Re
 inv_Pe = 1/Pe
-def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, batchsize, learning_rate, epochs, path, Diff, rho, Lambda_BC,Lambda_data, alpha, Flag_schedule):
+def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, xfd, yfd, zfd, tfd, batchsize, learning_rate, epochs, path, Diff, rho, Lambda_BC,Lambda_data, alpha, Flag_schedule):
 # def geo_train(device,xd, yd, zd, Td, batchsize, learning_rate, epochs, path, Diff, rho, Lambda_BC,Lambda_data, Flag_schedule):
     if (Flag_batch):
-        
+
         xb = torch.Tensor(xb).to(device)
         yb = torch.Tensor(yb).to(device)
         zb = torch.Tensor(zb).to(device)
-        
+
         t = torch.Tensor(t).to(device)
         xd = torch.Tensor(xd).to(device)
         yd = torch.Tensor(yd).to(device)
         zd = torch.Tensor(zd).to(device)
-        
+
         Td = torch.Tensor(Td).to(device)
-        Dd = torch.Tensor(Dd).to(device)
-        
+
         # full-domain physics tensors (alpha only controls their loss weight)
         xfd = torch.Tensor(xfd).to(device)
         yfd = torch.Tensor(yfd).to(device)
         zfd = torch.Tensor(zfd).to(device)
         tfd = torch.Tensor(tfd).to(device)
-        
+
         if(1):
             xb = xb.type(torch.cuda.FloatTensor)
             yb = yb.type(torch.cuda.FloatTensor)
@@ -107,26 +103,25 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
             xd = xd.type(torch.cuda.FloatTensor)
             yd = yd.type(torch.cuda.FloatTensor)
             zd = zd.type(torch.cuda.FloatTensor)
-            
+
             Td = Td.type(torch.cuda.FloatTensor)
-            Dd = Dd.type(torch.cuda.FloatTensor)
-            
+
             xfd = xfd.type(torch.cuda.FloatTensor)
             yfd = yfd.type(torch.cuda.FloatTensor)
             zfd = zfd.type(torch.cuda.FloatTensor)
             tfd = tfd.type(torch.cuda.FloatTensor)
-            
-        dataset = TensorDataset(t, xd, yd, zd, Td, Dd)
+
+        dataset = TensorDataset(t, xd, yd, zd, Td)
         dataloader = DataLoader(dataset, batch_size = batchsize, shuffle = True, num_workers = 0, drop_last = True)
-        
+
         # full-domain physics loader (alpha scales its contribution to the loss)
         fd_dataset = TensorDataset(tfd, xfd, yfd, zfd)
         fd_dataloader = DataLoader(fd_dataset, batch_size = batchsize, shuffle = True, num_workers = 0, drop_last = True)
-        
-        
+
+
         input_n = 3
         input_s = 4
-        
+
     class Swish(nn.Module):
         def __init__(self, inplace=True):
             super(Swish, self).__init__()
@@ -156,17 +151,17 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
             super(SingleScaleFourierNet, self).__init__()
             # Fourier feature extractor
             self.fourier = FourierFeatures(input_dim, num_frequencies, std)
-            
+
             # Adjusted input size: original inputs + Fourier features
             fourier_dim = input_dim + 2 * num_frequencies
-            
+
             # Main network
             layers = [nn.Linear(fourier_dim, h_n), Swish()]
             for _ in range(num_layers):
                 layers.append(nn.Linear(h_n, h_n))
                 layers.append(Swish())
             layers.append(nn.Linear(h_n, output_dim))
-            
+
             self.main = nn.Sequential(*layers)
         def forward(self, x):
             # Apply Fourier features
@@ -178,7 +173,6 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
     net2_w = SingleScaleFourierNet(input_n, h_n, 1, num_layers, num_frequencies, std=std).to(device)
     net2_p = SingleScaleFourierNet(input_n, h_n, 1, num_layers, num_frequencies, std=std).to(device)
     net2_T = SingleScaleFourierNet(input_s, h_n, 1, num_layers, num_frequencies, std=std).to(device)
-    net2_D = SingleScaleFourierNet(input_s, h_n, 1, num_layers, num_frequencies, std=std).to(device)
     def init_normal(m):
         if type(m) == nn.Linear:
             nn.init.kaiming_normal_(m.weight)
@@ -187,36 +181,32 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
     net2_w.apply(init_normal)
     net2_p.apply(init_normal)
     net2_T.apply(init_normal)
-    net2_D.apply(init_normal)
     print("Using AdamW optimizer")
     optimizer_u = optim.AdamW(net2_u.parameters(), lr = learning_rate, betas = (0.9, 0.99), eps = 10**-15)
     optimizer_v = optim.AdamW(net2_v.parameters(), lr = learning_rate, betas = (0.9, 0.99), eps = 10**-15)
     optimizer_w = optim.AdamW(net2_w.parameters(), lr = learning_rate, betas = (0.9, 0.99), eps = 10**-15)
     optimizer_p = optim.AdamW(net2_p.parameters(), lr = learning_rate, betas = (0.9, 0.99), eps = 10**-15)
     optimizer_T = optim.AdamW(net2_T.parameters(), lr = learning_rate, betas = (0.9, 0.99), eps = 10**-15)
-    optimizer_D = optim.AdamW(net2_D.parameters(), lr = learning_rate, betas = (0.9, 0.99), eps = 10**-15)
-    
+
     def criterion(t,x,y,z):
         t.requires_grad = True
         x.requires_grad = True
         y.requires_grad = True
         z.requires_grad = True
-        
+
         net_in = torch.cat((x,y,z), 1)
         u = net2_u(net_in)
         u = u.view(len(u), -1)
-        v = net2_v(net_in)  
+        v = net2_v(net_in)
         v = v.view(len(v), -1)
-        w = net2_w(net_in)  
+        w = net2_w(net_in)
         w = w.view(len(w), -1)
         P = net2_p(net_in)
         P = P.view(len(P), -1)
         net_in2 = torch.cat((t,x,y,z), 1)
         T = net2_T(net_in2)
         T = T.view(len(T), -1)
-        D = net2_D(net_in2)
-        D = D.view(len(D), -1)
-        
+
         u_x = torch.autograd.grad(u,x,grad_outputs=torch.ones_like(x),create_graph = True,only_inputs=True)[0]
         u_xx = torch.autograd.grad(u_x,x,grad_outputs=torch.ones_like(x),create_graph = True,only_inputs=True)[0]
         u_y = torch.autograd.grad(u,y,grad_outputs=torch.ones_like(y),create_graph = True,only_inputs=True)[0]
@@ -238,7 +228,7 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
         P_x = torch.autograd.grad(P,x,grad_outputs=torch.ones_like(x),create_graph = True,only_inputs=True)[0]
         P_y = torch.autograd.grad(P,y,grad_outputs=torch.ones_like(y),create_graph = True,only_inputs=True)[0]
         P_z = torch.autograd.grad(P,z,grad_outputs=torch.ones_like(z),create_graph = True,only_inputs=True)[0]
-        
+
         T_x = torch.autograd.grad(T,x,grad_outputs=torch.ones_like(x),create_graph = True,only_inputs=True)[0]
         T_xx = torch.autograd.grad(T_x,x,grad_outputs=torch.ones_like(x),create_graph = True,only_inputs=True)[0]
         T_y = torch.autograd.grad(T,y,grad_outputs=torch.ones_like(y),create_graph = True,only_inputs=True)[0]
@@ -246,32 +236,23 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
         T_z = torch.autograd.grad(T,z,grad_outputs=torch.ones_like(z),create_graph = True,only_inputs=True)[0]
         T_zz = torch.autograd.grad(T_z,z,grad_outputs=torch.ones_like(z),create_graph = True,only_inputs=True)[0]
         T_t = torch.autograd.grad(T,t,grad_outputs=torch.ones_like(t),create_graph = True,only_inputs=True)[0]
-        D_x = torch.autograd.grad(D,x,grad_outputs=torch.ones_like(x),create_graph = True,only_inputs=True)[0]
-        D_xx = torch.autograd.grad(D_x,x,grad_outputs=torch.ones_like(x),create_graph = True,only_inputs=True)[0]
-        D_y = torch.autograd.grad(D,y,grad_outputs=torch.ones_like(y),create_graph = True,only_inputs=True)[0]
-        D_yy = torch.autograd.grad(D_y,y,grad_outputs=torch.ones_like(y),create_graph = True,only_inputs=True)[0]
-        D_z = torch.autograd.grad(D,z,grad_outputs=torch.ones_like(z),create_graph = True,only_inputs=True)[0]
-        D_zz = torch.autograd.grad(D_z,z,grad_outputs=torch.ones_like(z),create_graph = True,only_inputs=True)[0]
-        D_t = torch.autograd.grad(D,t,grad_outputs=torch.ones_like(t),create_graph = True,only_inputs=True)[0]
         # Calculate losses for continuity, momentum, and energy equations
         loss_1 = u_x + v_y + w_z
         loss_2 = (u*u_x + v*u_y + w*u_z) + P_x - (inv_Re*(u_xx+u_yy+u_zz))
         loss_3 = (u*v_x + v*v_y + w*v_z) + P_y - (inv_Re*(v_xx+v_yy+v_zz))
         loss_4 = (u*w_x + v*w_y + w*w_z) + P_z - (inv_Re*(w_xx+w_yy+w_zz))
         loss_5 = T_t + (u*T_x + v*T_y + w*T_z) - (inv_Pe * (T_xx+T_yy+T_zz))
-        loss_6 = D_t + (u*D_x + v*D_y + w*D_z) - (inv_Pe * (D_xx+D_yy+D_zz))
         loss_f = nn.MSELoss()
-        
+
         loss_continuty  = loss_f(loss_1,torch.zeros_like(loss_1))
-        loss_x_momentum = loss_f(loss_2,torch.zeros_like(loss_2)) 
+        loss_x_momentum = loss_f(loss_2,torch.zeros_like(loss_2))
         loss_y_momentum = loss_f(loss_3,torch.zeros_like(loss_3))
         loss_z_momentum = loss_f(loss_4,torch.zeros_like(loss_4))
         loss_adv_diff   = loss_f(loss_5,torch.zeros_like(loss_5))
-        loss_adv_diff_2 = loss_f(loss_6,torch.zeros_like(loss_6))
-        
-        return loss_continuty, loss_x_momentum, loss_y_momentum, loss_z_momentum, loss_adv_diff, loss_adv_diff_2
-    
-    
+
+        return loss_continuty, loss_x_momentum, loss_y_momentum, loss_z_momentum, loss_adv_diff
+
+
     def Loss_BC2(xb, yb, zb):
         net_in = torch.cat((xb,yb,zb), 1)
         out1_u = net2_u(net_in)
@@ -280,36 +261,25 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
         out1_v = out1_v.view(len(out1_v), -1)
         out1_w = net2_w(net_in)
         out1_w = out1_w.view(len(out1_w), -1)
-        
-        
+
+
         loss_f = nn.MSELoss()
-        
-        loss_noslip = loss_f(out1_u, torch.zeros_like(out1_u)) + loss_f(out1_v, torch.zeros_like(out1_v)) + loss_f(out1_w, torch.zeros_like(out1_w)) 
+
+        loss_noslip = loss_f(out1_u, torch.zeros_like(out1_u)) + loss_f(out1_v, torch.zeros_like(out1_v)) + loss_f(out1_w, torch.zeros_like(out1_w))
         return loss_noslip
-    
+
     def Loss_data(t,xd,yd,zd,Td):
         net_in1 = torch.cat((t,xd,yd,zd), 1)
         out1_T = net2_T(net_in1)
         out1_T = out1_T.view(len(out1_T), -1) * T_scale
-        
+
         loss_f = nn.MSELoss()
         loss_d = loss_f(out1_T, Td)
-        
-        return loss_d
-    
-    def Loss_data_2(t,xd,yd,zd,Dd):
-        net_in1 = torch.cat((t,xd,yd,zd), 1)
-        out1_D = net2_D(net_in1)
-        out1_D = out1_D.view(len(out1_D), -1) * D_scale
-        
-        loss_f = nn.MSELoss()
-        loss_d = loss_f(out1_D, Dd)
-        
+
         return loss_d
     tic = time.time()
     if (Flag_schedule):
-        
-        scheduler_D_NN = torch.optim.lr_scheduler.StepLR(optimizer_D,  step_size=step_epoch, gamma=decay_rate)
+
         scheduler_T_NN = torch.optim.lr_scheduler.StepLR(optimizer_T,  step_size=step_epoch, gamma=decay_rate)
         scheduler_U_NN = torch.optim.lr_scheduler.StepLR(optimizer_u,  step_size=step_epoch, gamma=decay_rate)
         scheduler_V_NN = torch.optim.lr_scheduler.StepLR(optimizer_v,  step_size=step_epoch, gamma=decay_rate)
@@ -321,9 +291,7 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
     Loss_Y_MOM  = torch.zeros(epochs, 1)
     Loss_Z_MOM  = torch.zeros(epochs, 1)
     Loss_ADV    = torch.zeros(epochs, 1)
-    Loss_ADV_2 = torch.zeros(epochs, 1)
     Loss_DATA   = torch.zeros(epochs, 1)
-    Loss_DATA_2 = torch.zeros(epochs, 1)
     Loss_BC     = torch.zeros(epochs, 1)
     # full-domain (OUT) physics loss history
     Loss_CON_OUT    = torch.zeros(epochs, 1)
@@ -331,7 +299,6 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
     Loss_Y_MOM_OUT  = torch.zeros(epochs, 1)
     Loss_Z_MOM_OUT  = torch.zeros(epochs, 1)
     Loss_ADV_OUT    = torch.zeros(epochs, 1)
-    Loss_ADV_2_OUT  = torch.zeros(epochs, 1)
 # Access example: loss_trackers['CON'][epoch] = ...
     # iterator for the full-domain loader (always active; alpha scales the loss)
     fd_iter = iter(fd_dataloader)
@@ -341,30 +308,25 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
         loss_y_mom = 0.0
         loss_z_mom = 0.0
         loss_adv = 0.0
-        loss_adv_2 = 0.0
         loss_data = 0.0
-        loss_data_2 = 0.0
         loss_bc = 0.0
         loss_con_out = 0.0
         loss_x_mom_out = 0.0
         loss_y_mom_out = 0.0
         loss_z_mom_out = 0.0
         loss_adv_out = 0.0
-        loss_adv_2_out = 0.0
-        for batch_idx, (t_in1, x_in1, y_in1, z_in1, T_in1, D_in1) in enumerate(dataloader):
+        for batch_idx, (t_in1, x_in1, y_in1, z_in1, T_in1) in enumerate(dataloader):
             # Zero gradients for each optimizer
             optimizer_u.zero_grad()
             optimizer_v.zero_grad()
             optimizer_w.zero_grad()
             optimizer_p.zero_grad()
             optimizer_T.zero_grad()
-            optimizer_D.zero_grad()
             # Compute losses
-            batch_con, batch_x_mom, batch_y_mom, batch_z_mom, batch_adv, batch_adv_2 = criterion(t_in1, x_in1, y_in1, z_in1)
+            batch_con, batch_x_mom, batch_y_mom, batch_z_mom, batch_adv = criterion(t_in1, x_in1, y_in1, z_in1)
             batch_data = Loss_data(t_in1, x_in1, y_in1, z_in1, T_in1)
-            batch_data_2 = Loss_data_2(t_in1, x_in1, y_in1, z_in1, D_in1)
             batch_bc = Loss_BC2(xb, yb, zb)
-            
+
             # --- physics on the FULL domain (Full_Domain.vtk); alpha scales its weight ---
             # Forward pass is ALWAYS computed so the OUT losses are always tracked.
             #   alpha = 0  ->  contribution is zero (no gradient from full domain)
@@ -374,15 +336,14 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
             except StopIteration:
                 fd_iter = iter(fd_dataloader)
                 (tfd_b, xfd_b, yfd_b, zfd_b) = next(fd_iter)
-            batch_con_out, batch_x_mom_out, batch_y_mom_out, batch_z_mom_out, batch_adv_out, batch_adv_2_out = criterion(tfd_b, xfd_b, yfd_b, zfd_b)
-            
+            batch_con_out, batch_x_mom_out, batch_y_mom_out, batch_z_mom_out, batch_adv_out = criterion(tfd_b, xfd_b, yfd_b, zfd_b)
+
             # Total loss
-            loss = (Lambda_con * batch_con) + (Lambda_x * batch_x_mom)  + (Lambda_y * batch_y_mom) + (Lambda_z * batch_z_mom) + (Lambda_adv * batch_adv) + (Lambda_adv_2 * batch_adv_2) + (Lambda_data * batch_data)+ (Lambda_data_2 * batch_data_2) + (Lambda_bc * batch_bc) 
-            loss = loss + (alpha * Lambda_con * batch_con_out) + (alpha * Lambda_x * batch_x_mom_out) + (alpha * Lambda_y * batch_y_mom_out) + (alpha * Lambda_z * batch_z_mom_out) + (alpha * Lambda_adv * batch_adv_out) + (alpha * Lambda_adv_2 * batch_adv_2_out)
+            loss = (Lambda_con * batch_con) + (Lambda_x * batch_x_mom)  + (Lambda_y * batch_y_mom) + (Lambda_z * batch_z_mom) + (Lambda_adv * batch_adv) + (Lambda_data * batch_data) + (Lambda_bc * batch_bc)
+            loss = loss + (alpha * Lambda_con * batch_con_out) + (alpha * Lambda_x * batch_x_mom_out) + (alpha * Lambda_y * batch_y_mom_out) + (alpha * Lambda_z * batch_z_mom_out) + (alpha * Lambda_adv * batch_adv_out)
             loss.backward()
             # Optimizer steps
             with torch.no_grad():
-                optimizer_D.step()
                 optimizer_u.step()
                 optimizer_v.step()
                 optimizer_w.step()
@@ -390,14 +351,11 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
                 optimizer_p.step()
             # Update losses
             loss_con += batch_con.detach()
-            loss_adv += batch_adv.detach()
             loss_x_mom += batch_x_mom.detach()
             loss_y_mom += batch_y_mom.detach()
             loss_z_mom += batch_z_mom.detach()
             loss_adv += batch_adv.detach()
-            loss_adv_2 += batch_adv_2.detach()
             loss_data += batch_data.detach()
-            loss_data_2 += batch_data_2.detach()
             loss_bc += batch_bc.detach()
             # Update full-domain (OUT) losses
             loss_con_out += batch_con_out.detach()
@@ -405,43 +363,37 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
             loss_y_mom_out += batch_y_mom_out.detach()
             loss_z_mom_out += batch_z_mom_out.detach()
             loss_adv_out += batch_adv_out.detach()
-            loss_adv_2_out += batch_adv_2_out.detach()
-        
+
         N = len(dataloader)  # Number of batches
         Loss_CON[epoch] = loss_con / N
         Loss_X_MOM[epoch] = loss_x_mom / N
-        Loss_Y_MOM[epoch] = loss_y_mom / N 
-        Loss_Z_MOM[epoch] = loss_z_mom / N 
-        Loss_ADV[epoch] = loss_adv / N 
+        Loss_Y_MOM[epoch] = loss_y_mom / N
+        Loss_Z_MOM[epoch] = loss_z_mom / N
+        Loss_ADV[epoch] = loss_adv / N
         Loss_DATA[epoch] = loss_data / N
-        Loss_DATA_2[epoch] = loss_data_2 / N
         Loss_BC[epoch] = loss_bc / N
-        Loss_ADV_2[epoch] = loss_adv_2 / N 
         Loss_CON_OUT[epoch] = loss_con_out / N
         Loss_X_MOM_OUT[epoch] = loss_x_mom_out / N
         Loss_Y_MOM_OUT[epoch] = loss_y_mom_out / N
         Loss_Z_MOM_OUT[epoch] = loss_z_mom_out / N
         Loss_ADV_OUT[epoch] = loss_adv_out / N
-        Loss_ADV_2_OUT[epoch] = loss_adv_2_out / N
-        print(f'Total Loss [EPOCH = {epoch}]: \nContinuity Loss: {Loss_CON[epoch].item()} \nX-Momentum Loss: {Loss_X_MOM[epoch].item()} \nY-Momentum Loss: {Loss_Y_MOM[epoch].item()} \nZ-Momentum-Loss : {Loss_Z_MOM[epoch].item()} \nAdv-Diff-Loss: {Loss_ADV[epoch].item()}  \nAdv-Diff Loss: {Loss_ADV_2[epoch].item()} \n'
-            f'Data Loss: {Loss_DATA[epoch].item()} \nData 2 Loss: {Loss_DATA_2[epoch].item()} \nBC Loss: {Loss_BC[epoch].item()}\n') 
-        print(f'[FULL-DOMAIN OUT | alpha={alpha}] CON_OUT: {Loss_CON_OUT[epoch].item()} X_MOM_OUT: {Loss_X_MOM_OUT[epoch].item()} Y_MOM_OUT: {Loss_Y_MOM_OUT[epoch].item()} Z_MOM_OUT: {Loss_Z_MOM_OUT[epoch].item()} ADV_OUT: {Loss_ADV_OUT[epoch].item()} ADV2_OUT: {Loss_ADV_2_OUT[epoch].item()}\n')
-        
+        print(f'Total Loss [EPOCH = {epoch}]: \nContinuity Loss: {Loss_CON[epoch].item()} \nX-Momentum Loss: {Loss_X_MOM[epoch].item()} \nY-Momentum Loss: {Loss_Y_MOM[epoch].item()} \nZ-Momentum-Loss : {Loss_Z_MOM[epoch].item()} \nAdv-Diff-Loss: {Loss_ADV[epoch].item()} \n'
+            f'Data Loss: {Loss_DATA[epoch].item()} \nBC Loss: {Loss_BC[epoch].item()}\n')
+        print(f'[FULL-DOMAIN OUT | alpha={alpha}] CON_OUT: {Loss_CON_OUT[epoch].item()} X_MOM_OUT: {Loss_X_MOM_OUT[epoch].item()} Y_MOM_OUT: {Loss_Y_MOM_OUT[epoch].item()} Z_MOM_OUT: {Loss_Z_MOM_OUT[epoch].item()} ADV_OUT: {Loss_ADV_OUT[epoch].item()}\n')
+
         print(f"LEARNING RATE: {optimizer_u.param_groups[0]['lr']}")
         # Save model weights periodically
         if epoch % (epochs-1) == 0:
             # Add optimizer type to filename with short abbreviations
             opt = "A"  # S=SOAP, A=AdamW
-            
-            torch.save(net2_D.state_dict(), path_weights + f"D_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
-            torch.save(net2_T.state_dict(), path_weights + f"T_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
-            torch.save(net2_u.state_dict(), path_weights + f"U_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
-            torch.save(net2_v.state_dict(), path_weights + f"V_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
-            torch.save(net2_w.state_dict(), path_weights + f"W_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
-            torch.save(net2_p.state_dict(), path_weights + f"P_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
+
+            torch.save(net2_T.state_dict(), path_weights + f"T_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
+            torch.save(net2_u.state_dict(), path_weights + f"U_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
+            torch.save(net2_v.state_dict(), path_weights + f"V_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
+            torch.save(net2_w.state_dict(), path_weights + f"W_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
+            torch.save(net2_p.state_dict(), path_weights + f"P_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{epoch}.pt")
         # Learning rate scheduling
         if Flag_schedule:
-            scheduler_D_NN.step()
             scheduler_T_NN.step()
             scheduler_P_NN.step()
             scheduler_U_NN.step()
@@ -456,16 +408,13 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
     plt.plot(Loss_Y_MOM, label = 'Y-Mom Loss')
     plt.plot(Loss_Z_MOM, label = 'Z-Mom Loss')
     plt.plot(Loss_ADV, label = 'Adv Diff Loss')
-    plt.plot(Loss_ADV_2, label = 'Adv Diff 2 Loss')
     plt.plot(Loss_DATA, label='Data Loss')
-    plt.plot(Loss_DATA_2, label='Data Loss 2')
     plt.plot(Loss_BC, label='BC Loss')
     plt.plot(Loss_CON_OUT, label='Continuity OUT')
     plt.plot(Loss_X_MOM_OUT, label='X-Mom OUT')
     plt.plot(Loss_Y_MOM_OUT, label='Y-Mom OUT')
     plt.plot(Loss_Z_MOM_OUT, label='Z-Mom OUT')
     plt.plot(Loss_ADV_OUT, label='Adv OUT')
-    plt.plot(Loss_ADV_2_OUT, label='Adv 2 OUT')
     plt.legend()
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
@@ -473,10 +422,10 @@ def geo_train(device, xb, yb, zb, t, xd, yd, zd, Td, Dd, xfd, yfd, zfd, tfd, bat
     plt.title(f'Loss (alpha={alpha})')
     # Add optimizer type to loss figure filename with abbreviated names
     opt = "A"
-    plt.savefig(f'Loss_pre/Loss_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}.jpg')
+    plt.savefig(f'Loss_pre/Loss_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}.jpg')
     # plt.show()
-    
-    return 
+
+    return
 ### Main Code ###
 def load_vtk_file(filename):
     reader = vtk.vtkDataSetReader()
@@ -493,7 +442,6 @@ def extract_field_array(data, field_name):
     return VN.vtk_to_numpy(array)
 # ------------------ Configuration ------------------
 threshold = 0.0
-vtk_field_2 = 'D'
 vtk_field = 'Concentration'
 vtk_path = "CFD_Data/"
 wall_file = f"{vtk_path}Wall.vtk"
@@ -502,7 +450,7 @@ print(f'Files to be loaded: {file_start} to {file_end}')
 # Number of timesteps
 num_timesteps = file_end - file_start + 1
 time_array = np.linspace(0, 1, num_timesteps)
-X_total, Y_total, Z_total, temp_total, D_total, t_total = [], [], [], [], [], []
+X_total, Y_total, Z_total, temp_total, t_total = [], [], [], [], []
 for idx, n in enumerate(range(file_start, file_end + 1)):
     mesh_file = f"{vtk_path}Data_{n}.vtk"
     print(f"Reading {mesh_file}")
@@ -510,22 +458,19 @@ for idx, n in enumerate(range(file_start, file_end + 1)):
         data_vtk = load_vtk_file(mesh_file)
         coords = extract_coordinates(data_vtk)
         temp = extract_field_array(data_vtk, vtk_field)
-        d = extract_field_array(data_vtk, vtk_field_2)
     except Exception as e:
         print(f"Error loading {mesh_file}: {e}")
         continue
     x, y, z = coords[:, 0:1], coords[:, 1:2], coords[:, 2:3]
-    
+
     # Scale time between 0 and 1 based on number of files
     t_val = time_array[idx]
     t_vals = np.full_like(x, t_val)
     temp = temp.reshape(-1, 1)
-    d = d.reshape(-1, 1)
     X_total.append(x)
     Y_total.append(y)
     Z_total.append(z)
     temp_total.append(temp)
-    D_total.append(d)
     t_total.append(t_vals)
 # Convert and normalize data
 X = np.vstack(X_total) / X_scale
@@ -533,7 +478,6 @@ Y = np.vstack(Y_total) / Y_scale
 Z = np.vstack(Z_total) / Z_scale
 T = np.vstack(temp_total)
 T = np.where(T < threshold, threshold, T)
-D = np.vstack(D_total)
 t = np.vstack(t_total)
 # Process wall boundary mesh
 print(f"\nLoading boundary file: {wall_file}")
@@ -568,7 +512,6 @@ xd = X
 yd = Y
 zd = Z
 Td = T
-Dd = D
 # Summary output
 def summarize_field(name, arr):
     print(f"{name:>20}: min = {np.min(arr):.4f}, max = {np.max(arr):.4f}")
@@ -580,7 +523,6 @@ summarize_field("Xd input", xd)
 summarize_field("Yd input", yd)
 summarize_field("Zd input", zd)
 summarize_field("Td input", Td)
-summarize_field("Dd input", Dd)
 summarize_field("Time d input", t)
 summarize_field("Xfd input", xfd)
 summarize_field("Yfd input", yfd)
@@ -589,7 +531,7 @@ summarize_field("Zfd input", zfd)
 path = ""
 geo_train(
     device, xb, yb, zb,
-    t, xd, yd, zd, Td, Dd,
+    t, xd, yd, zd, Td,
     xfd, yfd, zfd, tfd,
     batchsize, learning_rate, epochs, path,
     Diff, rho, Lambda_bc, Lambda_data, alpha, Flag_schedule
@@ -693,17 +635,17 @@ def set_wall_velocity_to_zero(original_filename, wall_filename, output_filename)
     writer.Write()
 def create_vtk(t,x,y,z, mesh_file):
     print(f"Starting create_vtk for {mesh_file}")
-    
+
     t = torch.Tensor(t).to(device)
     x = torch.Tensor(x).to(device)
     y = torch.Tensor(y).to(device)
     z = torch.Tensor(z).to(device)
-    
+
     print("Tensors created and moved to device")
-    
+
     input_n = 4
     input_s = 3
-        
+
     class Swish(nn.Module):
         def __init__(self, inplace=True):
             super(Swish, self).__init__()
@@ -733,17 +675,17 @@ def create_vtk(t,x,y,z, mesh_file):
             super(SingleScaleFourierNet, self).__init__()
             # Fourier feature extractor
             self.fourier = FourierFeatures(input_dim, num_frequencies, std)
-            
+
             # Adjusted input size: original inputs + Fourier features
             fourier_dim = input_dim + 2 * num_frequencies
-            
+
             # Main network
             layers = [nn.Linear(fourier_dim, h_n), Swish()]
             for _ in range(num_layers):
                 layers.append(nn.Linear(h_n, h_n))
                 layers.append(Swish())
             layers.append(nn.Linear(h_n, output_dim))
-            
+
             self.main = nn.Sequential(*layers)
         def forward(self, x):
             # Apply Fourier features
@@ -755,26 +697,24 @@ def create_vtk(t,x,y,z, mesh_file):
     net2_w = SingleScaleFourierNet(input_s, h_n, 1, num_layers, num_frequencies, std=std).to(device)
     net2_p = SingleScaleFourierNet(input_s, h_n, 1, num_layers, num_frequencies, std=std).to(device)
     net2_T = SingleScaleFourierNet(input_n, h_n, 1, num_layers, num_frequencies, std=std).to(device)
-    net2_D = SingleScaleFourierNet(input_n, h_n, 1, num_layers, num_frequencies, std=std).to(device)
     print("Loading the network weights...")
     print(f"Looking for weights at epoch {step}")
-    
+
     # Check if weight files exist (use same optimizer type as training)
     opt = "A"  # S=SOAP, A=AdamW
     weight_files = [
-        f"D_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
-        f"T_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
-        f"U_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
-        f"V_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
-        f"W_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
-        f"P_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt"
+        f"T_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
+        f"U_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
+        f"V_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
+        f"W_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt",
+        f"P_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}.pt"
     ]
-    
+
     missing_files = []
     for wf in weight_files:
         if not os.path.exists(path_weights + wf):
             missing_files.append(wf)
-    
+
     if missing_files:
         print(f"ERROR: Missing weight files: {missing_files}")
         print(f"Available files in {path_weights}:")
@@ -784,21 +724,19 @@ def create_vtk(t,x,y,z, mesh_file):
         else:
             print("Weight directory doesn't exist!")
         return
-    
+
     print("All weight files found, loading...")
-    
+
     try:
-        net2_D.load_state_dict(torch.load(path_weights + weight_files[0]))
-        print("Loaded D weights")
-        net2_T.load_state_dict(torch.load(path_weights + weight_files[1]))
+        net2_T.load_state_dict(torch.load(path_weights + weight_files[0]))
         print("Loaded T weights")
-        net2_u.load_state_dict(torch.load(path_weights + weight_files[2]))
+        net2_u.load_state_dict(torch.load(path_weights + weight_files[1]))
         print("Loaded U weights")
-        net2_v.load_state_dict(torch.load(path_weights + weight_files[3]))
+        net2_v.load_state_dict(torch.load(path_weights + weight_files[2]))
         print("Loaded V weights")
-        net2_w.load_state_dict(torch.load(path_weights + weight_files[4]))
+        net2_w.load_state_dict(torch.load(path_weights + weight_files[3]))
         print("Loaded W weights")
-        net2_p.load_state_dict(torch.load(path_weights + weight_files[5]))
+        net2_p.load_state_dict(torch.load(path_weights + weight_files[4]))
         print("Loaded P weights")
     except Exception as e:
         print(f"ERROR loading weights: {e}")
@@ -808,50 +746,45 @@ def create_vtk(t,x,y,z, mesh_file):
     net2_w.eval()
     net2_p.eval()
     net2_T.eval()
-    net2_D.eval()
     t.requires_grad = True
     x.requires_grad = True
     y.requires_grad = True
     z.requires_grad = True
     print("Starting forward pass...")
-    
+
     net_in = torch.cat((x,y,z), 1)
     print(f"Created net_in with shape: {net_in.shape}")
     print("Computing velocity components...")
     u = net2_u((net_in))
     u = u.view(len(u), -1)
     print("U computed")
-    
+
     v = net2_v((net_in))
     v = v.view(len(v), -1)
     print("V computed")
-    
+
     w = net2_w((net_in))
     w = w.view(len(w), -1)
     print("W computed")
-    
+
     p = net2_p((net_in))
     p = p.view(len(p), -1)
     p = p.data.numpy()
     p = p * P_scale
     print("P computed")
-    
+
     net_in2 = torch.cat((t,x,y,z), 1)
     T = net2_T((net_in2))
     T = T.view(len(T), -1)
     T = T.data.numpy()
     T = T * T_scale
-    D = net2_D((net_in2))
-    D = D.view(len(D), -1)
-    D = D.data.numpy()
-    D = D * D_scale
     u = u.data.numpy()
     v = v.data.numpy()
     w = w.data.numpy()
     u = u * U_scale
     v = v * U_scale
-    w = w * U_scale 
-    mesh_file2 = mesh_file 
+    w = w * U_scale
+    mesh_file2 = mesh_file
     # Read the VTK dataset
     reader = vtk.vtkDataSetReader()
     reader.SetFileName(mesh_file2)
@@ -862,7 +795,7 @@ def create_vtk(t,x,y,z, mesh_file):
     point_data.ShallowCopy(data_vtk)
     print(n_points)
     Velocity = np.zeros((n_points,3))
-    Velocity[:,0] = u[:,0] 
+    Velocity[:,0] = u[:,0]
     Velocity[:,1] = v[:,0]
     Velocity[:,2] = w[:,0]
     theta_vtk = VN.numpy_to_vtk(Velocity)
@@ -878,41 +811,29 @@ def create_vtk(t,x,y,z, mesh_file):
     theta_vtk.SetName('Temp_PINN')
     data_vtk.GetPointData().AddArray(theta_vtk)
     myoutput = vtk.vtkDataSetWriter()
-    
+
     myoutput.SetInputData(data_vtk)
-    
+
     myoutput.SetFileName(output_filename)
-    
+
     myoutput.Write()
-    D = np.zeros((n_points,1))
-    D[:,0] =  D[:,0]
-    theta_vtk = VN.numpy_to_vtk(D)
-    theta_vtk.SetName('D_PINN')
-    data_vtk.GetPointData().AddArray(theta_vtk)
-    myoutput = vtk.vtkDataSetWriter()
-    
-    myoutput.SetInputData(data_vtk)
-    
-    myoutput.SetFileName(output_filename)
-    
-    myoutput.Write()
-    
+
     Pressure = np.zeros((n_points,1))
     Pressure[:,0] =  p[:,0]
     theta_vtk = VN.numpy_to_vtk(Pressure)
     theta_vtk.SetName('Pressure_PINN')
     data_vtk.GetPointData().AddArray(theta_vtk)
     myoutput = vtk.vtkDataSetWriter()
-    
+
     myoutput.SetInputData(data_vtk)
-    
+
     myoutput.SetFileName(output_filename)
-    
+
     myoutput.Write()
     if Lambda_bc ==0:
         set_wall_velocity_to_zero(output_filename, "CFD_Data/Wall.vtk",output_filename)
     compute_wss_and_save_vtk(output_filename, 'Vel_PINN', output_filename_2)
-    
+
     print('Done!')
 #########
 device = torch.device("cpu")
@@ -934,12 +855,12 @@ else:
 for idx, m in enumerate(range(file_start, file_end + 1)):
     filename = f"CFD_Data/Data_{m}.vtk"
     print(f"Processing {filename}")
-    
+
     # Check if file exists
     if not os.path.exists(filename):
         print(f"ERROR: File {filename} not found! Skipping...")
         continue
-    
+
     try:
         reader = vtk.vtkDataSetReader()
         reader.SetFileName(filename)
@@ -974,9 +895,9 @@ for idx, m in enumerate(range(file_start, file_end + 1)):
     t_val = time_array[idx]
     t = np.full_like(x, t_val)
     opt = "A"  # S=SOAP, A=AdamW
-    output_filename = f"Results_pre/D_PINN_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}_{m}.vtk"
+    output_filename = f"Results_pre/PINN_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}_{m}.vtk"
     print('Output file name:', output_filename)
-    output_filename_2 = f"Results_pre/D_PINN_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_ld2{Lambda_data_2}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_la2{Lambda_adv_2}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}_WSS_{m}.vtk"
+    output_filename_2 = f"Results_pre/PINN_{opt}_s{std}_f{num_frequencies}_us{U_scale}_ld{Lambda_data}_lb{Lambda_bc}_lc{Lambda_con}_lx{Lambda_x}_ly{Lambda_y}_lz{Lambda_z}_la{Lambda_adv}_al{alpha}_e{epochs}_ps{P_scale}_b{batchsize}_n{h_n}_l{num_layers}_f1{file_start}_f2{file_end}_ep{step}_WSS_{m}.vtk"
     print('Time', t)
     try:
         create_vtk(t, x, y, z, filename)
