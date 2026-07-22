@@ -18,7 +18,7 @@ script_start_time = time.time()
 set_log_level(LogLevel.WARNING)
 parameters["std_out_all_processes"] = False
 
-forward_dir = "Results_BFS_InletBC_small"
+forward_dir = "Results_BFS"
 
 epochs = 200
 
