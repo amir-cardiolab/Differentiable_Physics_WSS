@@ -221,7 +221,7 @@ MASK_TOL = 1e-6   # increase (e.g. 1e-4) if mask/mesh were built independently
 # ==============================================================================
 # OUTPUT DIRECTORIES
 # ==============================================================================
-BASE_DIR = "Inverse_TwoOutlet_1K_HardConstraint"
+BASE_DIR = "Inverse_Results"
 os.makedirs(BASE_DIR, exist_ok=True)
 RUN_TAG = (
     f"{OPTIMIZER.upper()}"
