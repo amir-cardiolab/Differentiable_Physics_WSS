@@ -8,8 +8,8 @@ a chosen **y-window**.
 
 | Script | Method | Reads | Writes |
 |--------|--------|-------|--------|
-| [`PINN.py`](PINN.py) | Physics-Informed NN (PyTorch) | `Results_BFS_InletBC_small/` (`Data_*.vtk`, `Wall.vtk`, `WSS.csv`) | `Runs/<y-window>/<timestamp>/` |
-| [`Diff_Physics.py`](Diff_Physics.py) | Adjoint inverse (FEniCS + dolfin-adjoint) | `Results_BFS_InletBC_small/` (`mesh.xdmf`, `concentration.xdmf`, `velocity_field.xdmf`) | `Inverse_Results_*/` |
+| [`PINN.py`](PINN.py) | Physics-Informed NN (PyTorch) | `Results_BFS/` (`Data_*.vtk`, `Wall.vtk`, `WSS.csv`) | `Runs/<y-window>/<timestamp>/` |
+| [`Diff_Physics.py`](Diff_Physics.py) | Adjoint inverse (FEniCS + dolfin-adjoint) | `Results_BFS/` (`mesh.xdmf`, `concentration.xdmf`, `velocity_field.xdmf`) | `Inverse_Results_*/` |
 
 ## The y-observation window (both scripts)
 
