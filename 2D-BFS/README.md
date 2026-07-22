@@ -52,15 +52,6 @@ The data bundle is **pruned to only the files actually used**. Contents:
   far-field run, point the loader at the `Early_*` files and set the y-window
   to `[0.3, 0.4]`.
 
-> **Removed during pruning** (not read by any script): all other `Data_*`/`Early_*`
-> snapshots, the `Clipped_aligned/` and `Full_aligned/` variants, and the
-> auxiliary `Vel_GT.vtk`, `WSS.vtk`, `adv_diff_residual_history.npy`,
-> `Final_solution_inletBC_small.pdf`.
->
-> The full concentration time-series (`concentration.xdmf`/`.h5`, ~15 GB) was
-> also removed: the inverse only needs the single forward step `final_idx=4000`,
-> which is now provided as the small `C_4000.vtk` and loaded by `Diff_Physics.py`.
-
 ## Run
 
 ```bash
