@@ -744,7 +744,7 @@ if __name__ == "__main__":
     device_train = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_infer = torch.device("cpu")
     # ------------------------------------------------------------------ paths
-    vtk_path      = "Results_BFS_InletBC_small"
+    vtk_path      = "Results_BFS"
     vtk_field     = "C"
     threshold     = 0.0
     wall_vtk_file = os.path.join(vtk_path, "Wall.vtk")
