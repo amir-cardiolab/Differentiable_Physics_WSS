@@ -17,11 +17,9 @@ Each method is applied to two geometries:
 | [`2D-BFS/`](2D-BFS/) | 2-D backward-facing step | 2-D |
 | [`Coronary Artery/`](Coronary%20Artery/) | Patient-specific coronary artery | 3-D |
 
-[`2D-BFS-GPU/`](2D-BFS-GPU/) is a GPU implementation of the 2-D `Diff_Physics` inverse:
-same problem, discretisation and objective, with both PDE solves and their adjoints on the
-GPU (PyTorch + NVIDIA cuDSS) and dolfin-adjoint still driving the gradient. It agrees with the
-CPU code to round-off on the same control and runs one optimisation epoch about 160–180× faster
-(the 200-epoch Adam run: ≈ 8.5 min on an RTX 2000 Ada instead of ≈ 39 h on one CPU core).
+[`2D-BFS-GPU/`](2D-BFS-GPU/) is a GPU implementation of the 2-D `Diff_Physics` inverse
+(PyTorch + NVIDIA cuDSS): one optimisation epoch takes about 4 s on an RTX 2000 Ada instead
+of about 12 min on one CPU core.
 
 See the per-case READMEs for details:
 - [2D-BFS/README.md](2D-BFS/README.md)
