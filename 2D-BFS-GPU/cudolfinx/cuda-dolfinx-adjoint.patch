@@ -1,0 +1,2973 @@
+diff --git a/cpp/cudolfinx/fem/CUDACoefficient.h b/cpp/cudolfinx/fem/CUDACoefficient.h
+index 1eacd8f..7c614c7 100644
+--- a/cpp/cudolfinx/fem/CUDACoefficient.h
++++ b/cpp/cudolfinx/fem/CUDACoefficient.h
+@@ -55,6 +55,25 @@ public:
+     CUDA::safeMemcpyHtoD(_dvalues, (void*)(_x->array().data()), _dvalues_size);
+   }
+ 
++  /// Update the device-side values directly from another device array (no host round
++  /// trip), e.g. the solution vector of a GPU solve that is the coefficient of the next
++  /// assembly. Copies min(nbytes, size of the coefficient array) bytes from the start.
++  void copy_from_device(CUdeviceptr src, size_t nbytes)
++  {
++    size_t n = nbytes < _dvalues_size ? nbytes : _dvalues_size;
++    CUresult cuda_err = cuMemcpyDtoD(_dvalues, src, n);
++    if (cuda_err != CUDA_SUCCESS) {
++      const char* cuda_err_description;
++      cuGetErrorString(cuda_err, &cuda_err_description);
++      throw std::runtime_error(
++        "cuMemcpyDtoD() failed with " + std::string(cuda_err_description) +
++        " at " + std::string(__FILE__) + ":" + std::to_string(__LINE__));
++    }
++  }
++
++  /// Size in bytes of the device-side value array (local + ghost dofs)
++  size_t device_values_size() const { return _dvalues_size; }
++
+   void copy_device_values_to_host()
+   {
+     CUDA::safeMemcpyDtoH((void*)_values.data(), _dvalues, _dvalues_size);
+diff --git a/cpp/cudolfinx/fem/CUDAForm.h b/cpp/cudolfinx/fem/CUDAForm.h
+index 1c8f1e2..a188488 100644
+--- a/cpp/cudolfinx/fem/CUDAForm.h
++++ b/cpp/cudolfinx/fem/CUDAForm.h
+@@ -193,7 +193,31 @@ public:
+   void to_device(const CUDA::Context& cuda_context)
+   {
+     _coefficients.copy_coefficients_to_device(cuda_context);
+-    _constants.update_constant_values(); 
++    _constants.update_constant_values();
++  }
++
++  /// Copy only the given coefficients (and the constants) to the device
++  void to_device(const CUDA::Context& cuda_context,
++                 const std::vector<std::shared_ptr<const Function<T, U>>>& functions)
++  {
++    std::vector<int> indices;
++    for (const auto& f : functions) {
++      int i = _coefficients.index_of(f.get());
++      if (i >= 0) indices.push_back(i);
++    }
++    _coefficients.copy_coefficients_to_device(cuda_context, indices);
++    _constants.update_constant_values();
++  }
++
++  /// Update a coefficient's device values from a device array (e.g. the CUDA array of a
++  /// PETSc vector holding a new solution), without going through the host.
++  /// Returns false if the Function is not a coefficient of this form.
++  bool update_coefficient_from_device(const Function<T, U>* f, CUdeviceptr src, size_t nbytes)
++  {
++    int i = _coefficients.index_of(f);
++    if (i < 0) return false;
++    _coefficients.copy_coefficient_from_device(i, src, nbytes);
++    return true;
+   }
+ 
+   void set_restriction(
+diff --git a/cpp/cudolfinx/fem/CUDAFormCoefficients.h b/cpp/cudolfinx/fem/CUDAFormCoefficients.h
+index a5f6ea6..f9e148f 100644
+--- a/cpp/cudolfinx/fem/CUDAFormCoefficients.h
++++ b/cpp/cudolfinx/fem/CUDAFormCoefficients.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#include <map>
++#include <memory>
+ #include <dolfinx/fem/Form.h>
+ 
+ #include <cudolfinx/common/CUDA.h>
+@@ -98,7 +100,10 @@ public:
+       std::vector<int> dofmaps_num_dofs_per_cell(num_coefficients);
+       std::vector<CUdeviceptr> dofmaps_dofs_per_cell(num_coefficients);
+       for (int i = 0; i < num_coefficients; i++) {
+-        _device_coefficients.push_back(std::make_shared<CUDACoefficient<T,U>>(_coefficients[i]));
++        // One device copy per Function, shared by every form that uses it (a Newton
++        // problem's F, J and lifting all see the same buffer, so the host->device copy of
++        // the iterate happens once per update instead of once per form).
++        _device_coefficients.push_back(shared_device_coefficient(_coefficients[i]));
+ 	_coefficient_device_ptrs.push_back(_device_coefficients[i]->device_values());
+         const fem::CUDADofMap* cuda_dofmap =
+           dofmap_store.get_device_object(_coefficients[i]->function_space()->dofmap().get()).get();
+@@ -341,6 +346,48 @@ public:
+     }
+   }
+ 
++  /// Copy only the coefficients with the given indices (see index_of) to the device.
++  void copy_coefficients_to_device(
++    const CUDA::Context& cuda_context, const std::vector<int>& indices)
++  {
++    for (int i : indices) {
++      if (i < 0 || i >= (int) _device_coefficients.size())
++        throw std::runtime_error("Coefficient index out of range in copy_coefficients_to_device");
++      _device_coefficients[i]->copy_host_values_to_device();
++    }
++  }
++
++  /// Position of a Function among the form's coefficients, or -1
++  int index_of(const Function<T, U>* f) const
++  {
++    for (int i = 0; i < (int) _coefficients.size(); i++)
++      if (_coefficients[i].get() == f) return i;
++    return -1;
++  }
++
++  /// Update coefficient i from a device array (device-to-device, no host round trip)
++  void copy_coefficient_from_device(int i, CUdeviceptr src, size_t nbytes)
++  {
++    if (i < 0 || i >= (int) _device_coefficients.size())
++      throw std::runtime_error("Coefficient index out of range in copy_coefficient_from_device");
++    _device_coefficients[i]->copy_from_device(src, nbytes);
++  }
++
++  /// The process-wide registry of device coefficients, keyed by the host Function.
++  /// Entries are weak: a buffer is freed when the last form using it is destroyed.
++  static std::shared_ptr<CUDACoefficient<T,U>> shared_device_coefficient(
++    std::shared_ptr<const Function<T, U>> f)
++  {
++    static std::map<const Function<T, U>*, std::weak_ptr<CUDACoefficient<T,U>>> registry;
++    auto it = registry.find(f.get());
++    if (it != registry.end()) {
++      if (auto existing = it->second.lock()) return existing;
++    }
++    auto created = std::make_shared<CUDACoefficient<T,U>>(f);
++    registry[f.get()] = created;
++    return created;
++  }
++
+ private:
+   /// The underlying coefficients on the host
+   std::vector<std::shared_ptr<const Function<T, U>>> _coefficients;
+diff --git a/python/cudolfinx/adjoint/__init__.py b/python/cudolfinx/adjoint/__init__.py
+new file mode 100644
+index 0000000..7afeee3
+--- /dev/null
++++ b/python/cudolfinx/adjoint/__init__.py
+@@ -0,0 +1,66 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""cudolfinx.adjoint: discrete adjoints for GPU-assembled DOLFINx problems.
++
++Built on `pyadjoint <https://github.com/dolfin-adjoint/pyadjoint>`_ (the tape used by
++dolfin-adjoint). Forward solves, adjoint solves and gradient assembly all run on the GPU
++through cuDOLFINx; Constants are differentiated through a real element on the CPU.
++
++Minimal example::
++
++    from cudolfinx import adjoint as ad
++    u = ad.Function(V)
++    f = ad.Function(V); f.interpolate(...)
++    problem = ad.LinearProblem(a, L, u, bcs, petsc_options={...})
++    problem.solve()
++    J = ad.assemble_scalar(u**2 * ufl.dx)
++    rf = ad.ReducedFunctional(J, ad.Control(f))
++    dJdf = rf.derivative()
++    ad.taylor_test(rf, f, h)        # should report rate 2
++
++Not yet available: Hessians / tangent-linear models, derivatives with respect to mesh
++coordinates, Expressions as controls, and MPI-parallel runs (serial only).
++"""
++
++from pyadjoint import (
++    AdjFloat,
++    Control,
++    ReducedFunctional,
++    compute_gradient,
++    get_working_tape,
++    minimize,
++    pause_annotation,
++    continue_annotation,
++    set_working_tape,
++    stop_annotating,
++    taylor_test,
++)
++
++from pyadjoint.tape import Tape
++
++if get_working_tape() is None:          # pyadjoint has no default tape; dolfin-adjoint creates one on import
++    set_working_tape(Tape())
++continue_annotation()                   # pyadjoint records nothing until annotation is switched on
++
++from .assembly import AssembleBlock, assemble_scalar, assign
++from .solving import LinearProblem, NonlinearProblem, SolveBlock
++from .types import Constant, Function
++from .timeloop import linear_time_loop
++from . import affine, gpu
++
++__all__ = [
++    "AdjFloat", "Control", "ReducedFunctional", "compute_gradient", "get_working_tape", "minimize",
++    "pause_annotation", "continue_annotation", "set_working_tape", "stop_annotating", "taylor_test",
++    "Function", "Constant", "LinearProblem", "NonlinearProblem", "assemble_scalar", "assign",
++    "SolveBlock", "AssembleBlock", "gpu", "linear_time_loop",
++]
++
++
++def stats() -> dict:
++    """Counters: compiled CUDA forms, GPU assemblies, adjoint solves, CPU constant derivatives."""
++    from . import affine
++    from . import timeloop
++    return dict(gpu.STATS, **affine.STATS, **timeloop.STATS)
+diff --git a/python/cudolfinx/adjoint/affine.py b/python/cudolfinx/adjoint/affine.py
+new file mode 100644
+index 0000000..07e5978
+--- /dev/null
++++ b/python/cudolfinx/adjoint/affine.py
+@@ -0,0 +1,308 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""Affine replay of linear forms: a cell loop becomes a sparse matrix-vector product.
++
++Most vectors assembled in an inverse problem are affine in the coefficients that change
++between two assemblies: the right-hand side of a time step (linear in the previous state), the
++adjoint gradient contributions action(adjoint(∂F/∂m), λ) (linear in λ), the derivative of a
++quadratic functional. For such a form
++
++    L(c_1, ..., c_k; fixed) = Σ_i M_i c_i + b,      M_i = ∂L/∂c_i (a matrix), b = L(0)
++
++the matrices are assembled once (while the *fixed* coefficients keep their values) and every
++later evaluation is k sparse matrix-vector products on the GPU (cuSPARSE through PETSc), a few
++hundredths of a millisecond instead of a cell loop over the mesh.
++
++Which coefficients vary is learnt, not declared: a coefficient is promoted from "fixed" to
++"varying" the first time its values are seen to change, if the form is linear in it and has
++no product with another varying coefficient (checked symbolically with UFL). A change of a
++coefficient the form is not linear in, or of a Constant, invalidates the matrices (a "miss");
++a form that misses too often is assembled directly from then on.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++from petsc4py import PETSc
++
++import ufl
++from ufl.algorithms import expand_derivatives
++from dolfinx import fem
++
++from . import gpu
++
++import os
++VERBOSE = os.environ.get("CUDOLFINX_ADJOINT_VERBOSE", "0") == "1"
++STATS = {"affine_forms": 0, "affine_replays": 0, "affine_matrices": 0, "affine_misses": 0,
++         "affine_disabled": 0, "affine_direct": 0}
++_FORMS: dict[tuple, "AffineForm"] = {}
++_VECS: dict[int, tuple] = {}            # function space id -> (space, CUDA work vector for SpMV input)
++
++
++def _is_zero_form(f) -> bool:
++    try:
++        f = expand_derivatives(f)
++    except Exception:
++        return False
++    if isinstance(f, ufl.form.ZeroBaseForm):
++        return True
++    return hasattr(f, "integrals") and len(f.integrals()) == 0
++
++
++def _cuda_vec(V, like: PETSc.Vec, slot=None) -> PETSc.Vec:
++    """A CUDA Vec with the owned size of V (one per (space, slot), reused). One vector per
++    coefficient (slot = its id) so that the SpMVs of one form never share an input vector."""
++    hit = _VECS.get((id(V), slot))
++    if hit is None:
++        n = gpu.owned(V)
++        if like.getLocalSize() == n:
++            v = like.duplicate()
++        else:
++            v = PETSc.Vec().create(V.mesh.comm)
++            v.setType(like.getType())
++            v.setSizes((n, None))
++            v.setUp()
++        hit = (V, v)                     # keep V alive: its id is the key
++        _VECS[(id(V), slot)] = hit
++    return hit[1]
++
++
++class AffineForm:
++    """One linear form, evaluated through matrices once its varying coefficients are known."""
++
++    def __init__(self, form: ufl.Form, jit_options=None):
++        self.form = form
++        self.jit = jit_options
++        self.cf = gpu.cuda_form(form, jit_options)
++        self.coeffs = [c for c in form.coefficients() if isinstance(c, fem.Function)]
++        self.consts = list(form.constants())
++        self.fixed_values: dict[int, np.ndarray] | None = None     # id(coeff) -> values at build
++        self.const_values: list[np.ndarray] = []
++        self.varying: dict[int, tuple] = {}                        # id(coeff) -> (coeff, CUDAMatrix, Mat, constant ids)
++        self.linear_ok: dict[int, bool] = {}
++        self.depends: dict[int, bool] = {}
++        self.b: PETSc.Vec | None = None
++        self.y: PETSc.Vec | None = None
++        self.tmp: PETSc.Vec | None = None
++        self.scratch: PETSc.Vec | None = None
++        self.uses = self.misses = 0
++        self.disabled = False
++        STATS["affine_forms"] += 1
++
++    # ------------------------------------------------------------------ symbolic checks
++    def _depends_on(self, c) -> bool:
++        """The form depends on c at all (∂L/∂c is not the zero form). UFL keeps a derivative of
++        a functional as one integral per original integral, so a derivative form carries
++        coefficients it does not depend on; their changes are irrelevant and a matrix for them
++        would be the (uncompilable) zero form."""
++        ok = self.depends.get(id(c))
++        if ok is None:
++            try:
++                ok = not _is_zero_form(ufl.derivative(self.form, c, ufl.TrialFunction(c.function_space)))
++            except Exception:
++                ok = True
++            self.depends[id(c)] = ok
++        return ok
++
++    def _linear_in(self, c) -> bool:
++        """The form is linear in c (its second derivative in c vanishes)."""
++        ok = self.linear_ok.get(id(c))
++        if ok is None:
++            try:
++                d1 = ufl.derivative(self.form, c, ufl.TrialFunction(c.function_space))
++                ok = _is_zero_form(ufl.derivative(d1, c, ufl.TrialFunction(c.function_space)))
++            except Exception:
++                ok = False
++            self.linear_ok[id(c)] = ok
++        return ok
++
++    def _independent(self, c, d) -> bool:
++        """No term of the form contains both c and d (∂²L/∂c∂d = 0)."""
++        try:
++            d1 = ufl.derivative(self.form, c, ufl.TrialFunction(c.function_space))
++            return _is_zero_form(ufl.derivative(d1, d, ufl.TrialFunction(d.function_space)))
++        except Exception:
++            return False
++
++    # ------------------------------------------------------------------ state
++    def _work(self):
++        if self.y is None:
++            wv = gpu.work_vector(self.cf).vector
++            self.y, self.b, self.tmp, self.scratch = wv.duplicate(), wv.duplicate(), wv.duplicate(), wv.duplicate()
++
++    def _snapshot(self):
++        self.fixed_values = {id(c): c.x.array.copy() for c in self.coeffs if id(c) not in self.varying}
++        self.const_values = [np.array(k.value, copy=True) for k in self.consts]
++
++    def _changed_fixed(self) -> list:
++        out = []
++        for c in self.coeffs:
++            if id(c) in self.varying or not self._depends_on(c):
++                continue
++            old = self.fixed_values.get(id(c))
++            if old is None or old.shape != c.x.array.shape or not np.array_equal(old, c.x.array):
++                out.append(c)
++        return out
++
++    def _consts_changed(self) -> bool:
++        return bool(self._changed_consts())
++
++    def _changed_consts(self) -> set:
++        return {id(k) for k, v in zip(self.consts, self.const_values) if not np.array_equal(np.asarray(k.value), v)}
++
++    def _build_matrix(self, c):
++        Mform = ufl.derivative(self.form, c, ufl.TrialFunction(c.function_space))
++        mat, pmat = gpu.assemble_matrix(Mform, [], self.jit)
++        STATS["affine_matrices"] += 1
++        consts = {id(k) for k in expand_derivatives(Mform).constants()}
++        return (c, mat, pmat, consts)
++
++    def _input_vec(self, c, device_values: dict | None) -> PETSc.Vec:
++        if device_values and id(c) in device_values:
++            return device_values[id(c)]
++        v = _cuda_vec(c.function_space, self.y, id(c))
++        v.setArray(c.x.array[:v.getLocalSize()])
++        return v
++
++    def _spmv_sum(self, device_values, into: PETSc.Vec):
++        """into = Σ_i M_i c_i (current values)."""
++        first = True
++        for c, mat, pmat, _ in self.varying.values():
++            x = self._input_vec(c, device_values)
++            if first:
++                pmat.mult(x, into)
++                first = False
++            else:
++                pmat.mult(x, self.scratch)      # never self.tmp: learn() may be holding the direct value there
++                into.axpy(1.0, self.scratch)
++        if first:
++            into.set(0.0)
++
++    def _disable(self):
++        self.disabled = True
++        STATS["affine_disabled"] += 1
++        self.varying.clear()
++
++    # ------------------------------------------------------------------ evaluation
++    def replay(self, into: PETSc.Vec, device_values: dict | None = None) -> bool:
++        """into = L(current values) through the matrices. False when a direct assembly is
++        needed first (first call, or a fixed coefficient changed): then assemble directly and
++        pass the result to learn()."""
++        if self.disabled or self.fixed_values is None or self._consts_changed() or self._changed_fixed():
++            return False
++        self._spmv_sum(device_values, into)
++        into.axpy(1.0, self.b)
++        self.uses += 1
++        STATS["affine_replays"] += 1
++        return True
++
++    def learn(self, full: PETSc.Vec):
++        """Record a directly assembled value `full` (a CUDA Vec) at the live coefficient values:
++        promotes the coefficients that changed since the last record, or rebuilds."""
++        if self.disabled:
++            return
++        self._work()
++        if self.fixed_values is None:
++            full.copy(self.b)
++            self._snapshot()
++            return
++        changed = self._changed_fixed()
++        others = [v[0] for v in self.varying.values()]
++        changed_consts = self._changed_consts()
++        valid = all(self._linear_in(c) for c in changed) and all(
++            self._independent(c, d) for c in changed for d in others + [e for e in changed if e is not c])
++        if valid and changed_consts:
++            # a Constant changed: the matrices that contain it are stale, the others are not;
++            # b is recomputed from the direct value below either way
++            STATS["affine_misses"] += 1
++            for cid, (c, mat, pmat, consts) in list(self.varying.items()):
++                if consts & changed_consts:
++                    self.varying[cid] = self._build_matrix(c)
++        if not valid and VERBOSE:
++            import sys
++            print("[affine] miss on form %s: changed %s, consts changed %s, linear %s" % (
++                self.form.signature()[:12], [getattr(c, "name", "?") for c in changed], self._consts_changed(),
++                [self._linear_in(c) for c in changed]), file=sys.stderr)
++        if not valid:
++            self.misses += 1
++            STATS["affine_misses"] += 1
++            if self.misses * 4 > self.uses + 4:
++                self._disable()
++                return
++            for cid, (c, mat, pmat, _) in list(self.varying.items()):       # matrices at the new values
++                self.varying[cid] = self._build_matrix(c)
++        else:
++            for c in changed:
++                try:
++                    self.varying[id(c)] = self._build_matrix(c)
++                except Exception as e:
++                    if VERBOSE:
++                        import sys, traceback
++                        print("[affine] giving up on form %s: matrix for %s failed: %s" % (
++                            self.form.signature()[:12], getattr(c, "name", c), e), file=sys.stderr)
++                        traceback.print_exc()
++                        try:
++                            Mform = ufl.derivative(self.form, c, ufl.TrialFunction(c.function_space))
++                            print("[affine]   expanded matrix form:", expand_derivatives(Mform), file=sys.stderr)
++                            fm = fem.form(Mform)
++                            print("[affine]   dolfinx form module:", fm.module.__file__, "integral types", fm.integral_types,
++                                  "rank", fm.rank, file=sys.stderr)
++                            print("[affine]   original form:", self.form, file=sys.stderr)
++                        except Exception as e2:
++                            print("[affine]   diagnostics failed:", e2, file=sys.stderr)
++                    self._disable()
++                    return
++        self._snapshot()
++        self._spmv_sum(None, self.y)
++        full.copy(self.b)
++        self.b.axpy(-1.0, self.y)                           # b = L(current) - Σ M_i c_i(current)
++
++    def assemble(self, device_values: dict | None = None) -> np.ndarray:
++        """Owned values of the form for the live coefficient values (host array).
++        `device_values` maps id(coefficient) -> CUDA Vec holding its values (saves a copy)."""
++        self._work()
++        if self.replay(self.y, device_values):
++            return self.y.getArray(readonly=True).copy()
++        STATS["affine_direct"] += 1
++        full = gpu.assemble_vector(self.form, self.jit)
++        if not self.disabled:
++            self.tmp.setArray(full)
++            self.learn(self.tmp)
++        return full
++
++
++def affine_form(form: ufl.Form, jit_options=None) -> AffineForm:
++    key = gpu._key(form)
++    af = _FORMS.get(key)
++    if af is None:
++        af = AffineForm(form, jit_options)
++        _FORMS[key] = af
++    return af
++
++
++def assemble_vector(form: ufl.Form, jit_options=None, device_values: dict | None = None) -> np.ndarray:
++    """Drop-in for gpu.assemble_vector with affine replay."""
++    if not gpu.CONFIG.get("affine_replay", True):
++        return gpu.assemble_vector(form, jit_options)
++    return affine_form(form, jit_options).assemble(device_values)
++
++
++def clear():
++    for af in _FORMS.values():
++        af.varying.clear()                     # matrices: released with their CUDAMatrix wrappers
++        for vec in (af.y, af.b, af.tmp, af.scratch):
++            if vec is not None:
++                try:
++                    vec.destroy()
++                except Exception:
++                    pass
++    for _, v in _VECS.values():
++        try:
++            v.destroy()
++        except Exception:
++            pass
++    _FORMS.clear()
++    _VECS.clear()
+diff --git a/python/cudolfinx/adjoint/assembly.py b/python/cudolfinx/adjoint/assembly.py
+new file mode 100644
+index 0000000..848e9a5
+--- /dev/null
++++ b/python/cudolfinx/adjoint/assembly.py
+@@ -0,0 +1,113 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""Functionals: GPU-assembled scalars recorded on the tape, and Function assignment."""
++
++from __future__ import annotations
++
++import numpy as np
++
++import ufl
++from dolfinx import fem
++from pyadjoint import AdjFloat, Block
++from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
++
++from . import affine, gpu
++from .types import Constant, Function
++
++
++def assemble_scalar(form: ufl.Form, annotate=None, cuda_jit_options: dict | None = None) -> AdjFloat:
++    """Assemble a rank-0 form on the GPU (summed over MPI ranks) and record it."""
++    value = gpu.assemble_scalar(form, cuda_jit_options)
++    out = AdjFloat(value)
++    annotate = annotate_tape({"annotate": annotate} if annotate is not None else None)
++    if annotate:
++        block = AssembleBlock(form, cuda_jit_options)
++        get_working_tape().add_block(block)
++        block.add_output(out.block_variable)
++    return out
++
++
++class AssembleBlock(Block):
++    def __init__(self, form: ufl.Form, jit_options=None, ad_block_tag=None):
++        super().__init__(ad_block_tag=ad_block_tag)
++        self.form = form
++        self.jit_options = jit_options or {}
++        self.mesh = form.ufl_domain().ufl_cargo()
++        for c in tuple(form.coefficients()) + tuple(form.constants()):
++            if isinstance(c, (Function, Constant)):
++                self.add_dependency(c, no_duplicates=True)
++
++    def _values(self, inputs):
++        vals = {}
++        for bv, inp in zip(self.get_dependencies(), inputs):
++            obj = bv.output
++            if isinstance(obj, fem.Function):
++                vals[obj] = inp.x.array if isinstance(inp, fem.Function) else np.asarray(inp)
++            else:
++                vals[obj] = inp.value if isinstance(inp, fem.Constant) else np.asarray(inp)
++        return vals
++
++    def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
++        return self._values(inputs)
++
++    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
++        c = block_variable.output
++        w = float(adj_inputs[0])
++        with gpu.substituted(prepared):
++            if isinstance(c, Function):
++                dJ = gpu.derived(self.form, ("dJ", id(c)), lambda: ufl.derivative(
++                    self.form, c, ufl.TestFunction(c.function_space)))
++                return w * affine.assemble_vector(dJ, self.jit_options)
++            if isinstance(c, Constant):
++                return w * gpu.constant_derivative(self.form, c, self.mesh)
++        return None
++
++    def prepare_recompute_component(self, inputs, relevant_outputs):
++        return self._values(inputs)
++
++    def recompute_component(self, inputs, block_variable, idx, prepared):
++        with gpu.substituted(prepared):
++            return gpu.assemble_scalar(self.form, self.jit_options)
++
++
++def assign(target: Function, source, annotate=None) -> Function:
++    """target <- source (a Function on the same space, or an array / scalar), recorded on the
++    tape. Use this instead of ``target.x.array[:] = ...`` in annotated time loops (e.g.
++    ``assign(u_n, u)``), so the dependence of later steps on earlier ones is tracked."""
++    annotate = annotate_tape({"annotate": annotate} if annotate is not None else None)
++    if annotate:
++        block = AssignBlock(target, source)
++        get_working_tape().add_block(block)
++    with stop_annotating():
++        target.x.array[:] = source.x.array if isinstance(source, fem.Function) else source
++        target.x.scatter_forward()
++    if annotate:
++        block.add_output(target.create_block_variable())
++    return target
++
++
++class AssignBlock(Block):
++    def __init__(self, target, source, ad_block_tag=None):
++        super().__init__(ad_block_tag=ad_block_tag)
++        self.target = target
++        self.source_is_function = isinstance(source, Function)
++        if self.source_is_function:
++            self.add_dependency(source)
++        elif isinstance(source, fem.Function):        # a plain (not recorded) Function: data
++            self.source_value = source.x.array.copy()
++        else:
++            self.source_value = np.array(source, copy=True)
++
++    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
++        if not self.source_is_function:
++            return None
++        adj = adj_inputs[0]
++        return np.array(adj.x.array if isinstance(adj, fem.Function) else adj, copy=True)
++
++    def recompute_component(self, inputs, block_variable, idx, prepared):
++        out = self.target._ad_init_zero()
++        out.x.array[:] = inputs[0].x.array if self.source_is_function else self.source_value
++        return out
+diff --git a/python/cudolfinx/adjoint/gpu.py b/python/cudolfinx/adjoint/gpu.py
+new file mode 100644
+index 0000000..2e6a2b6
+--- /dev/null
++++ b/python/cudolfinx/adjoint/gpu.py
+@@ -0,0 +1,428 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""GPU helpers shared by the adjoint blocks: one assembler, a cache of compiled CUDA forms
++keyed by form structure *and* coefficient identity (an adjoint sweep over a time loop
++re-uses one compiled form for thousands of blocks), GPU vector/matrix assembly returning
++host arrays / PETSc CUDA matrices, and the Constant derivative through a real element."""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import typing
++
++import numpy as np
++from petsc4py import PETSc
++
++import basix.ufl
++import ufl
++from dolfinx import fem
++
++import cudolfinx as cufem
++
++_ASSEMBLER: cufem.CUDAAssembler | None = None
++_FORMS: dict[tuple, cufem.CUDAForm] = {}
++_VECTORS: dict[int, cufem.CUDAVector] = {}          # function space id -> work vector
++_MATRICES: dict[tuple, typing.Any] = {}              # form key -> CUDAMatrix
++_BCS: dict[tuple, typing.Any] = {}                   # ids of bcs -> packed device bcs
++# reuse_forward_operator: solve the adjoint of a linear problem with the forward matrix and its
++# preconditioner / factorisation when that is exact (see LinearProblem.adjoint_solver).
++CONFIG = {"reuse_forward_operator": os.environ.get("CUDOLFINX_ADJOINT_REUSE_FORWARD", "1") != "0",
++          # linear forms affine in their changing coefficients: matrices once, SpMV afterwards
++          "affine_replay": os.environ.get("CUDOLFINX_ADJOINT_AFFINE", "1") != "0"}
++STATS = {"compiled_forms": 0, "gpu_vector_assemblies": 0, "gpu_matrix_assemblies": 0,
++         "adjoint_solves": 0, "adjoint_operator_reused": 0, "forward_operator_reused": 0,
++         "liftings_skipped": 0,
++         "constant_derivatives": 0,
++         "cpu_constant_derivatives": 0}
++
++
++def assembler() -> cufem.CUDAAssembler:
++    global _ASSEMBLER
++    if _ASSEMBLER is None:
++        _ASSEMBLER = cufem.CUDAAssembler()
++    return _ASSEMBLER
++
++
++def _key(form: ufl.Form) -> tuple:
++    """Identity of a form: UFL's signature renumbers coefficients, constants AND the domain, so
++    the objects themselves (kept alive by the cache entries) must be part of the key."""
++    return ((form.signature(), id(form.ufl_domain().ufl_cargo()))
++            + tuple(id(c) for c in form.coefficients()) + tuple(id(c) for c in form.constants()))
++
++
++def cuda_form(form: ufl.Form, jit_options: dict | None = None) -> cufem.CUDAForm:
++    """Compiled CUDA form for `form`; compiled once per (structure, coefficient objects)."""
++    key = _key(form)
++    cf = _FORMS.get(key)
++    if cf is None:
++        cf = cufem.form(form, cuda_jit_args=jit_options or {})
++        # keep the UFL form, its coefficients, constants and mesh alive: their ids are in the key
++        cf._adjoint_keep = (form, form.ufl_domain().ufl_cargo(), tuple(form.coefficients()), tuple(form.constants()))
++        _FORMS[key] = cf
++        STATS["compiled_forms"] += 1
++    return cf
++
++
++_DERIVED: dict[tuple, tuple] = {}
++
++
++def derived(owner: ufl.Form, tag, build: typing.Callable[[], ufl.Form]) -> ufl.Form:
++    """A UFL form derived from `owner` (a derivative, an adjoint action, ...), built once.
++
++    A time loop records thousands of blocks on the same form; the symbolic work of
++    ufl.derivative / ufl.adjoint / ufl.action and the form signature would otherwise be redone
++    for each of them. Looked up by the owner's identity first, then by its structural key (the
++    same form re-created inside a loop)."""
++    k = (id(owner), tag)
++    hit = _DERIVED.get(k)
++    if hit is None:
++        ks = (_key(owner), tag)
++        hit = _DERIVED.get(ks)
++        if hit is None:
++            hit = (build(), owner)                   # keep the owner alive: its id is in the key
++            _DERIVED[ks] = hit
++        _DERIVED[k] = (hit[0], owner)
++    return hit[0]
++
++
++def pack_bcs(bcs) -> typing.Any:
++    key = tuple(id(bc) for bc in bcs)
++    packed = _BCS.get(key)
++    if packed is None:
++        packed = assembler().pack_bcs(list(bcs))
++        packed._adjoint_bcs = list(bcs)
++        _BCS[key] = packed
++    return packed
++
++
++def bc_values_zero(bcs) -> bool:
++    """True if every Dirichlet value is identically zero: the lifting b -= A g then vanishes
++    and need not be assembled (it costs a full cell loop of the bilinear form)."""
++    for bc in bcs:
++        g = bc.g
++        try:
++            if hasattr(g, "x"):
++                arr = g.x.array
++            elif hasattr(g, "value"):
++                arr = np.asarray(g.value)
++            else:
++                arr = np.asarray(g)
++        except Exception:
++            return False
++        if np.any(arr):
++            return False
++    return True
++
++
++_FUNCTIONS: dict[int, fem.Function] = {}            # function space id -> reusable Function
++
++
++def work_function(V, tag: str = "adjoint"):
++    """One reusable Function per (space, tag): forms built on it keep their compiled kernels."""
++    key = (id(V), tag)
++    f = _FUNCTIONS.get(key)
++    if f is None:
++        f = fem.Function(V, name=tag)
++        f._adjoint_space = V
++        _FUNCTIONS[key] = f
++    return f
++
++
++def work_vector(cf: cufem.CUDAForm) -> cufem.CUDAVector:
++    V = cf.function_spaces[0]
++    vec = _VECTORS.get(id(V))
++    if vec is None:
++        vec = assembler().create_vector(cf)
++        vec._adjoint_space = V
++        _VECTORS[id(V)] = vec
++    return vec
++
++
++def assemble_vector(form: ufl.Form, jit_options=None) -> np.ndarray:
++    """Assemble a linear form on the GPU; returns the owned entries as a numpy array."""
++    cf = cuda_form(form, jit_options)
++    vec = work_vector(cf)
++    assembler().assemble_vector(cf, vec)
++    STATS["gpu_vector_assemblies"] += 1
++    return vec.vector.getArray(readonly=True).copy()
++
++
++def assemble_matrix(form: ufl.Form, bcs, jit_options=None):
++    """Assemble a bilinear form on the GPU with Dirichlet rows/columns zeroed and unit
++    diagonal (DOLFINx's convention). Returns (CUDAMatrix, PETSc Mat)."""
++    cf = cuda_form(form, jit_options)
++    key = _key(form)
++    mat = _MATRICES.get(key)
++    if mat is None:
++        mat = assembler().create_matrix(cf)
++        _MATRICES[key] = mat
++    assembler().assemble_matrix(cf, mat, bcs=pack_bcs(bcs) if bcs else [])
++    mat.assemble()
++    mat.mat.assemble()
++    STATS["gpu_matrix_assemblies"] += 1
++    return mat, mat.mat
++
++
++_OPERATORS: dict[tuple, dict] = {}       # form key -> {"values", "mat", "ksp"}
++
++
++def coefficient_values(form: ufl.Form, bcs=None) -> list:
++    """Copies of the values a matrix assembled from `form` depends on (coefficients,
++    Constants, Dirichlet dof sets)."""
++    out = []
++    for c in tuple(form.coefficients()) + tuple(form.constants()):
++        if isinstance(c, fem.Function):
++            out.append(c.x.array.copy())
++        elif isinstance(c, fem.Constant):
++            out.append(np.array(c.value, copy=True))
++    for bc in bcs or []:
++        out.append(np.asarray(bc.dof_indices()[0]).copy())
++    return out
++
++
++def coefficient_values_unchanged(stored: list | None, form: ufl.Form, bcs=None) -> bool:
++    """True if the live values equal `stored` (a plain comparison: ~10x cheaper than hashing,
++    and a few tenths of a millisecond for 10^5 dofs)."""
++    if stored is None:
++        return False
++    live = []
++    for c in tuple(form.coefficients()) + tuple(form.constants()):
++        if isinstance(c, fem.Function):
++            live.append(c.x.array)
++        elif isinstance(c, fem.Constant):
++            live.append(np.asarray(c.value))
++    for bc in bcs or []:
++        live.append(np.asarray(bc.dof_indices()[0]))
++    if len(live) != len(stored):
++        return False
++    return all(a.shape == b.shape and np.array_equal(a, b) for a, b in zip(live, stored))
++
++
++def adjoint_operator(form: ufl.Form, bcs, options: dict, prefix: str, jit_options=None):
++    """Assembled adjoint operator A (GPU, Dirichlet rows/cols zeroed) and a KSP set up on it.
++
++    Cached per form structure: if the coefficient values are the ones the cached matrix was
++    built from (a time loop whose operator does not change), neither the assembly nor the
++    preconditioner / factorisation set-up is repeated. Returns (PETSc Mat, KSP, reused)."""
++    cf = cuda_form(form, jit_options)
++    key = _key(form)
++    entry = _OPERATORS.get(key)
++    if entry is not None and coefficient_values_unchanged(entry["values"], form, bcs):
++        return entry["mat"].mat, entry["ksp"], True
++    if entry is None:
++        mat = assembler().create_matrix(cf)
++        comm = form.ufl_domain().ufl_cargo().comm
++        ksp = make_ksp(comm, options, prefix)
++        entry = {"mat": mat, "ksp": ksp, "values": None}
++        if wants_cudss(options):
++            from cudolfinx import cudss
++            entry["cudss"] = cudss.attach(ksp, mat, **cudss.options_kwargs(options))
++        _OPERATORS[key] = entry
++    mat = entry["mat"]
++    assembler().assemble_matrix(cf, mat, bcs=pack_bcs(bcs) if bcs else [])
++    mat.assemble()
++    mat.mat.assemble()
++    entry["ksp"].setOperators(mat.mat)              # new values: PETSc rebuilds the PC on next solve
++    entry["values"] = coefficient_values(form, bcs)
++    STATS["gpu_matrix_assemblies"] += 1
++    return mat.mat, entry["ksp"], False
++
++
++def is_symmetric(A: PETSc.Mat, rtol: float = 1e-10) -> bool:
++    """A == A^T up to rtol, tested on the device with two fixed pseudo-random vectors:
++    |A x - A^T x| <= rtol |A x|. (No host copy of the matrix; PETSc's own test reads the host
++    arrays of an AIJ matrix.) A matrix that fails to be symmetric only below rtol is treated as
++    symmetric, which perturbs an adjoint solution by a relative amount of that order."""
++    x, y = A.createVecs()
++    z = y.duplicate()
++    rng = np.random.RandomState(12345)
++    ok = True
++    for _ in range(2):
++        x.setArray(rng.rand(x.getLocalSize()) - 0.5)
++        A.mult(x, y)
++        A.multTranspose(x, z)
++        ny = y.norm()
++        z.axpy(-1.0, y)
++        if z.norm() > rtol * max(ny, 1e-300):
++            ok = False
++            break
++    for v in (x, y, z):
++        v.destroy()
++    return ok
++
++
++def assemble_scalar(form: ufl.Form, jit_options=None) -> float:
++    cf = cuda_form(form, jit_options)
++    local = assembler().assemble_scalar(cf)
++    comm = form.ufl_domain().ufl_cargo().comm
++    return comm.allreduce(local, op=_MPI().SUM)
++
++
++def make_ksp(comm, options: dict | None, prefix: str) -> PETSc.KSP:
++    ksp = PETSc.KSP().create(comm)
++    ksp.setOptionsPrefix(prefix)
++    opts = PETSc.Options()
++    opts.prefixPush(prefix)
++    for k, v in (options or {}).items():
++        if (k == "pc_type" and v == "cudss") or k.startswith("pc_cudss_"):   # cudolfinx.cudss, not PETSc
++            continue
++        opts[k] = v
++    opts.prefixPop()
++    ksp.setFromOptions()
++    return ksp
++
++
++def wants_cudss(options: dict | None) -> bool:
++    return (options or {}).get("pc_type") == "cudss"
++
++
++_SOLVE_VECTORS: dict[int, tuple] = {}      # function space id -> (b, x) CUDA Vecs
++
++
++LAST_SOLUTION: list = [None]       # the CUDA Vec of the most recent adjoint solve (device copy of λ)
++
++
++def solve_on_gpu(ksp: PETSc.KSP, A: PETSc.Mat, rhs: np.ndarray, template: cufem.CUDAVector,
++                 transpose: bool = False) -> np.ndarray:
++    """Solve A x = rhs (or A^T x = rhs) with a PETSc KSP whose operator is already set; vectors
++    are CUDA Vecs (one pair per function space, reused by every adjoint solve)."""
++    key = id(getattr(template, "_adjoint_space", template))
++    pair = _SOLVE_VECTORS.get(key)
++    if pair is None or pair[0].getLocalSize() != rhs.size:
++        pair = (template.vector.duplicate(), template.vector.duplicate())
++        _SOLVE_VECTORS[key] = pair
++    b, x = pair
++    b.setArray(rhs)
++    if transpose:
++        ksp.solveTranspose(b, x)
++    else:
++        ksp.solve(b, x)
++    out = x.getArray(readonly=True).copy()
++    LAST_SOLUTION[0] = x
++    STATS["adjoint_solves"] += 1
++    return out
++
++
++# -----------------------------------------------------------------------------
++# swapping checkpointed values into the live Function / Constant objects
++# -----------------------------------------------------------------------------
++@contextlib.contextmanager
++def substituted(values: dict):
++    """Temporarily write `values` (numpy arrays) into live Functions / Constants.
++
++    cuDOLFINx compiles a form against specific coefficient objects, so the adjoint of a
++    recorded solve is evaluated by giving those objects their saved values for the
++    duration of the assembly, then restoring whatever they held."""
++    saved = []
++    for obj, val in values.items():
++        if isinstance(obj, fem.Function):
++            if obj.x.array.shape == np.shape(val) and np.array_equal(obj.x.array, val):
++                continue                      # already holds the saved values (e.g. the velocity
++            saved.append((obj, obj.x.array.copy()))   # field of every step of a time loop):
++            obj.x.array[:] = val                      # no save / write / restore
++        else:
++            if np.array_equal(np.asarray(obj.value), np.asarray(val).reshape(np.shape(obj.value))):
++                continue
++            saved.append((obj, np.array(obj.value, copy=True)))
++            obj.value = np.asarray(val).reshape(np.shape(obj.value))
++    try:
++        yield
++    finally:
++        for obj, val in saved:
++            if isinstance(obj, fem.Function):
++                obj.x.array[:] = val
++            else:
++                obj.value = val
++
++
++# -----------------------------------------------------------------------------
++# derivatives with respect to Constants: a piecewise-constant (DG0) stand-in
++# -----------------------------------------------------------------------------
++# UFL cannot differentiate with respect to a Constant, and DOLFINx 0.10 cannot build a
++# function space on basix's "real" element. A Constant c is therefore replaced by a DG0
++# Function with the same value in every cell; d(form)/d(c) is the sum over the cells of
++# d(form)/d(f_DG0), assembled on the GPU like every other vector.
++_DG0: dict[tuple, tuple] = {}
++
++
++def constant_stand_in(c: fem.Constant, mesh):
++    """(DG0 Function holding c's value in every cell) for differentiating w.r.t. c."""
++    shape = tuple(np.shape(c.value))
++    key = (id(c), id(mesh))
++    hit = _DG0.get(key)
++    if hit is None:
++        el = basix.ufl.element("DG", mesh.basix_cell(), 0, shape=shape)
++        V = fem.functionspace(mesh, el)
++        f = fem.Function(V)
++        hit = (V, f, c)
++        _DG0[key] = hit
++    V, f, _ = hit
++    f.x.array[:] = np.tile(np.asarray(c.value).ravel(), f.x.array.size // max(1, int(np.prod(shape)) or 1))
++    return f
++
++
++def constant_derivative(form: ufl.Form, c: fem.Constant, mesh, jit_options=None, device_values=None) -> np.ndarray:
++    """d(form)/dc for a rank-0 form, shaped like c.value."""
++    f = constant_stand_in(c, mesh)
++    dF = derived(form, ("d_constant", id(c)), lambda: ufl.derivative(
++        ufl.replace(form, {c: f}), f, ufl.TestFunction(f.function_space)))
++    try:
++        from . import affine
++        vec = affine.assemble_vector(dF, jit_options, device_values)   # GPU (SpMV once the matrix exists)
++    except Exception:
++        v = fem.assemble_vector(fem.form(dF))                      # CPU fallback
++        v.scatter_reverse(_la_add())
++        vec = np.array(v.array[:owned(f.function_space)])
++        STATS["cpu_constant_derivatives"] += 1
++    STATS["constant_derivatives"] += 1
++    ncomp = max(1, int(np.prod(np.shape(c.value))) or 1)
++    comm = mesh.comm
++    total = comm.allreduce(vec.reshape(-1, ncomp).sum(axis=0), op=_MPI().SUM)
++    return np.asarray(total).reshape(np.shape(c.value))
++
++
++def _la_add():
++    from dolfinx import la
++    return la.InsertMode.add
++
++
++def _MPI():
++    from mpi4py import MPI
++    return MPI
++
++
++def owned(V) -> int:
++    im = V.dofmap.index_map
++    return im.size_local * V.dofmap.index_map_bs
++
++
++def clear():
++    """Drop every cached GPU object (compiled forms, matrices, adjoint operators and their
++    factorisations, work vectors). Call it between independent problems - e.g. at the start of
++    every epoch of an optimisation that rebuilds its forms on new Functions - or the caches,
++    keyed by coefficient identity, grow with every epoch until the GPU runs out of memory."""
++    import gc
++    from . import affine, timeloop
++    affine.clear()
++    timeloop.clear()
++    # PETSc matrices are released by the CUDAMatrix wrappers when they are garbage collected
++    # (an explicit MatDestroy here double-frees with the C++ destructor); KSPs and own vectors
++    # can be destroyed directly.
++    for entry in _OPERATORS.values():
++        try:
++            entry["ksp"].destroy()
++        except Exception:
++            pass
++    for b, x in _SOLVE_VECTORS.values():
++        try:
++            b.destroy(); x.destroy()
++        except Exception:
++            pass
++    for d in (_FORMS, _VECTORS, _MATRICES, _BCS, _FUNCTIONS, _DG0, _OPERATORS, _SOLVE_VECTORS, _DERIVED):
++        d.clear()
++    LAST_SOLUTION[0] = None
++    gc.collect()
+diff --git a/python/cudolfinx/adjoint/solving.py b/python/cudolfinx/adjoint/solving.py
+new file mode 100644
+index 0000000..2ffa87f
+--- /dev/null
++++ b/python/cudolfinx/adjoint/solving.py
+@@ -0,0 +1,435 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""GPU linear / nonlinear problems that record themselves on the pyadjoint tape.
++
++Forward solve, adjoint solve and the assembly of every gradient contribution run through
++the cuDOLFINx assembler (GPU) and PETSc's CUDA solvers. The only CPU work is the
++derivative with respect to Constants (a handful of entries, see gpu.constant_derivative).
++
++For a recorded solve F(u; m_1, m_2, ...) = 0 with Dirichlet conditions u = g_k on Γ_k the
++block computes, given the adjoint input dJ/du:
++
++    (∂F/∂u)ᵀ λ = dJ/du          with λ = 0 on Dirichlet dofs
++    dJ/dm_i  = -(∂F/∂m_i)ᵀ λ       (assembled as action(adjoint(∂F/∂m_i), λ))
++    dJ/dg_k  = [dJ/du - (∂F/∂u)ᵀ λ] restricted to the dofs of Γ_k   (lifting sensitivity)
++
++which is the discrete adjoint used by dolfin-adjoint.
++"""
++
++from __future__ import annotations
++
++import typing
++
++import numpy as np
++from petsc4py import PETSc
++
++import ufl
++from dolfinx import fem
++from pyadjoint import Block
++from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
++
++import cudolfinx as cufem
++from cudolfinx.la import CUDAVector
++
++from . import affine, gpu
++from .types import Constant, Function, from_cpp
++
++_DEFAULT_ADJOINT_OPTIONS = {"ksp_type": "gmres", "pc_type": "gamg", "ksp_rtol": 1e-12,
++                            "ksp_max_it": 2000}
++_counter = [0]
++
++
++def _prefix(base: str) -> str:
++    _counter[0] += 1
++    return f"{base}{_counter[0]}_"
++
++
++def _overloaded_coefficients(forms: typing.Iterable[ufl.Form]):
++    """Overloaded Functions and Constants the forms depend on (UFL lists Constants apart)."""
++    out = []
++    for f in forms:
++        for c in tuple(f.coefficients()) + tuple(f.constants()):
++            if isinstance(c, (Function, Constant)) and c not in out:
++                out.append(c)
++    return out
++
++
++def _bc_value(bc):
++    """The overloaded Function used as this condition's value, or None (bc.g is the C++ object)."""
++    g = bc.g
++    if isinstance(g, Function):
++        return g
++    return from_cpp(g)
++
++
++def _bc_controls(bcs):
++    """Overloaded Functions used as Dirichlet values."""
++    out = []
++    for bc in bcs:
++        g = _bc_value(bc)
++        if g is not None and g not in out:
++            out.append(g)
++    return out
++
++
++class SolveBlock(Block):
++    """Tape record of one GPU solve."""
++
++    def __init__(self, problem, F: ufl.Form, u: Function, bcs, linear: bool, ad_block_tag=None):
++        super().__init__(ad_block_tag=ad_block_tag)
++        self.problem = problem
++        self.F = F                                   # residual form (action(a, u) - L for linear)
++        self.u = u
++        self.bcs = list(bcs)
++        self.linear = linear
++        self.V = u.function_space
++        for c in _overloaded_coefficients([F]):
++            if linear and c is u:
++                continue
++            self.add_dependency(c, no_duplicates=True)
++        for g in _bc_controls(self.bcs):
++            self.add_dependency(g, no_duplicates=True)
++        if not linear:
++            # the initial guess is a dependency of the nonlinear solve (no derivative)
++            self.add_dependency(u, no_duplicates=True)
++        self.add_output(u.create_block_variable())
++        # derived UFL forms (∂F/∂u adjoint, ∂F/∂m, ...) are identical for every block recorded by
++        # the same problem (same F, same coefficient objects): build and sign them once
++        self._forms = problem.__dict__.setdefault("_adjoint_forms", {})
++
++    def _derived(self, key, build):
++        f = self._forms.get(key)
++        if f is None:
++            f = build()
++            self._forms[key] = f
++        return f
++
++    # ------------------------------------------------------------------ helpers
++    def _values(self, inputs):
++        """{live object: saved numpy values} for the dependencies and the output."""
++        vals = {}
++        for bv, inp in zip(self.get_dependencies(), inputs):
++            obj = bv.output
++            if isinstance(obj, fem.Function):
++                vals[obj] = inp.x.array if isinstance(inp, fem.Function) else np.asarray(inp)
++            else:
++                vals[obj] = inp.value if isinstance(inp, fem.Constant) else np.asarray(inp)
++        out = self.get_outputs()[0].saved_output
++        vals[self.u] = out.x.array if isinstance(out, fem.Function) else np.asarray(out)
++        return vals
++
++    def _bc_dofs(self) -> np.ndarray:
++        cache = self.problem.__dict__.setdefault("_adjoint_bc_dofs", {})
++        key = tuple(id(bc) for bc in self.bcs)
++        d = cache.get(key)
++        if d is None:
++            d = np.zeros(0, dtype=np.int32) if not self.bcs else \
++                np.unique(np.concatenate([bc.dof_indices()[0] for bc in self.bcs]))
++            cache[key] = d
++        return d
++
++    # ------------------------------------------------------------------ adjoint
++    def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
++        adj_input = adj_inputs[0]
++        rhs = np.array(adj_input.x.array if isinstance(adj_input, fem.Function) else adj_input,
++                       dtype=np.float64)
++        values = self._values(inputs)
++        n_owned = gpu.owned(self.V)
++        lam_f = gpu.work_function(self.V)            # same object for every block of this space:
++        with gpu.substituted(values):                #   the forms built on it are compiled once
++            dFdu_adj = self._derived("dFdu_adj",
++                                     lambda: ufl.adjoint(ufl.derivative(self.F, self.u, ufl.TrialFunction(self.V))))
++            bc_dofs = self._bc_dofs()
++            rhs_hom = rhs[:n_owned].copy()
++            rhs_hom[bc_dofs[bc_dofs < n_owned]] = 0.0
++            fwd = self.problem.adjoint_solver() if (self.linear and gpu.CONFIG["reuse_forward_operator"]) else None
++            if fwd is not None:
++                # the forward matrix (as assembled now) is the adjoint operator or its transpose:
++                # no second assembly, no second preconditioner / factorisation
++                ksp, transpose = fwd
++                lam = gpu.solve_on_gpu(ksp, None, rhs_hom, self.problem.b, transpose=transpose)
++                gpu.STATS["forward_operator_reused"] += 1
++            else:
++                A, ksp, reused = gpu.adjoint_operator(dFdu_adj, self.bcs, self.problem.adjoint_options,
++                                                      self.problem.adjoint_prefix, self.problem.jit_options)
++                if reused:
++                    gpu.STATS["adjoint_operator_reused"] += 1
++                lam = gpu.solve_on_gpu(ksp, A, rhs_hom,
++                                       gpu.work_vector(gpu.cuda_form(dFdu_adj, self.problem.jit_options)))
++            lam_f.x.array[:n_owned] = lam
++            lam_f.x.scatter_forward()
++            lam_dev = {id(lam_f): gpu.LAST_SOLUTION[0]}          # λ is already on the device
++            adj_bdy = None
++            if _bc_controls(self.bcs):
++                # dJ/du - (∂F/∂u)ᵀ λ, with the unmodified operator: the lifting sensitivity
++                full = affine.assemble_vector(self._derived("dFdu_adj_lam", lambda: ufl.action(dFdu_adj, lam_f)),
++                                              self.problem.jit_options, lam_dev)
++                adj_bdy = rhs[:n_owned] - full
++        return {"values": values, "lam": lam_f, "lam_values": lam_f.x.array.copy(), "adj_bdy": adj_bdy,
++                "lam_dev": lam_dev}
++
++    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
++        c = block_variable.output
++        values, lam = prepared["values"], prepared["lam"]
++        lam.x.array[:] = prepared["lam_values"]           # shared work Function: restore this block's λ
++        if c is self.u and not self.linear:
++            return None                                       # no derivative w.r.t. the initial guess
++        is_bc_value = any(_bc_value(bc) is c for bc in self.bcs)
++        if isinstance(c, Function) and is_bc_value and c not in self.F.coefficients():
++            return self._bc_gradient(c, prepared["adj_bdy"])
++        with gpu.substituted(values):
++            if isinstance(c, Function):
++                form = self._derived(("dFdm_adj_lam", id(c)), lambda: ufl.action(
++                    ufl.adjoint(ufl.derivative(self.F, c, ufl.TrialFunction(c.function_space))), lam))
++                grad = -affine.assemble_vector(form, self.problem.jit_options, prepared.get("lam_dev"))
++                if is_bc_value:                                 # used both in F and as a bc value
++                    grad = grad + self._bc_gradient(c, prepared["adj_bdy"])
++                return grad
++            if isinstance(c, Constant):
++                pairing = self._derived("pairing", lambda: ufl.action(self.F, lam))   # λᵀ F(u, c): rank-0
++                mesh = self.V.mesh
++                return -gpu.constant_derivative(pairing, c, mesh, device_values=prepared.get("lam_dev"))
++        return None
++
++    def _bc_gradient(self, g: Function, adj_bdy: np.ndarray) -> np.ndarray:
++        """Entries of adj_bdy at the dofs constrained by the conditions using g, mapped into
++        g's function space (same space as u, or a collapsed sub-space)."""
++        out = np.zeros(gpu.owned(g.function_space))
++        n_owned = gpu.owned(self.V)
++        maps = self.problem.__dict__.setdefault("_adjoint_bc_maps", {})
++        for bc in self.bcs:
++            if _bc_value(bc) is not g:
++                continue
++            m = maps.get(id(bc))
++            if m is None:
++                dofs, _ = bc.dof_indices()
++                dofs = dofs[dofs < n_owned]
++                Vbc = bc.function_space
++                if Vbc.contains(g.function_space._cpp_object) and \
++                        Vbc.dofmap.index_map.size_local * Vbc.dofmap.index_map_bs == out.size:
++                    m = (dofs, dofs)
++                else:                                       # g lives in the collapsed sub-space
++                    _, parent = Vbc.collapse()
++                    pos = np.full(n_owned, -1, dtype=np.int64)
++                    pos[np.asarray(parent)] = np.arange(len(parent))
++                    keep = pos[dofs] >= 0
++                    m = (dofs[keep], pos[dofs[keep]])
++                maps[id(bc)] = m
++            src, dst = m
++            np.add.at(out, dst, adj_bdy[src])
++        return out
++
++    # ------------------------------------------------------------------ replay
++    def prepare_recompute_component(self, inputs, relevant_outputs):
++        return self._values(inputs)
++
++    def recompute_component(self, inputs, block_variable, idx, prepared):
++        # The saved inputs are written into the live objects only for the duration of the
++        # solve; afterwards every live object (including u) holds what it held before, so a
++        # recompute never changes what the user sees (pyadjoint keeps the result as a checkpoint).
++        with gpu.substituted(prepared):
++            with stop_annotating():
++                self.problem.solve()
++            return self.u._ad_copy()
++
++
++class LinearProblem:
++    """Solve a(u, v) = L(v) on the GPU with cuDOLFINx assembly and a PETSc (CUDA) KSP, and
++    record the solve on the pyadjoint tape.
++
++    Args:
++        a, L: bilinear and linear UFL forms.
++        u: the solution Function (an :class:`cudolfinx.adjoint.Function`).
++        bcs: Dirichlet conditions.
++        petsc_options: KSP options for the forward solve.
++        adjoint_petsc_options: KSP options for the adjoint solves (default: GMRES + GAMG).
++        constant_matrix: assemble the matrix only once (its coefficients never change).
++        cuda_jit_options: passed to the CUDA JIT compiler.
++    """
++
++    def __init__(self, a: ufl.Form, L: ufl.Form, u: Function, bcs=None, *, petsc_options: dict | None = None,
++                 adjoint_petsc_options: dict | None = None, constant_matrix: bool = False,
++                 petsc_options_prefix: str | None = None, cuda_jit_options: dict | None = None):
++        if not isinstance(u, Function):
++            raise TypeError("u must be a cudolfinx.adjoint.Function")
++        self.a, self.L, self.u = a, L, u
++        self.bcs = list(bcs or [])
++        self.jit_options = cuda_jit_options or {}
++        self.constant_matrix = constant_matrix
++        self._matrix_values = None                   # coefficient values the matrix was built from
++        self.asm = gpu.assembler()
++        self.cuda_a = gpu.cuda_form(a, self.jit_options)
++        self.cuda_L = gpu.cuda_form(L, self.jit_options)
++        self._affine_L = affine.affine_form(L, self.jit_options)
++        self.A = self.asm.create_matrix(self.cuda_a)
++        self.b = self.asm.create_vector(self.cuda_L)
++        self.x = self.b.vector.duplicate()
++        self.device_bcs = gpu.pack_bcs(self.bcs) if self.bcs else []
++        comm = u.function_space.mesh.comm
++        self.ksp = gpu.make_ksp(comm, petsc_options, petsc_options_prefix or _prefix("cuadj_linear_"))
++        if gpu.wants_cudss(petsc_options):
++            from cudolfinx import cudss
++            self._cudss = cudss.attach(self.ksp, self.A, **cudss.options_kwargs(petsc_options))
++        self.adjoint_options = adjoint_petsc_options or petsc_options or _DEFAULT_ADJOINT_OPTIONS
++        self.adjoint_prefix = _prefix("cuadj_linear_adjoint_")
++        # the adjoint may be solved with the forward operator only if no separate adjoint
++        # solver was asked for
++        self._own_adjoint_solver = adjoint_petsc_options is not None and adjoint_petsc_options != petsc_options
++        opts = petsc_options or {}
++        self._petsc_lu = opts.get("ksp_type") == "preonly" and opts.get("pc_type") == "lu"
++        self._symmetric = (None, False)              # (matrix state, result of the symmetry probe)
++        # residual form of the solve (what the adjoint differentiates)
++        self.F = ufl.action(a, u) - L
++
++    def solve(self, annotate=None) -> Function:
++        annotate = annotate_tape({"annotate": annotate} if annotate is not None else None)
++        if annotate:
++            block = SolveBlock(self, self.F, self.u, self.bcs, linear=True)
++            get_working_tape().add_block(block)
++        self._forward()
++        return self.u
++
++    def _ensure_matrix(self):
++        # constant_matrix is a hint guarded by a cheap value comparison: a tape replay with a
++        # perturbed upstream coefficient (Taylor test, optimisation step) still gets the matrix
++        # that belongs to the current values, and an unchanged loop pays no assembly.
++        if not (self.constant_matrix and gpu.coefficient_values_unchanged(self._matrix_values, self.a, self.bcs)):
++            self.asm.assemble_matrix(self.cuda_a, self.A, bcs=self.device_bcs)
++            self.A.assemble()
++            self.A.mat.assemble()
++            self.ksp.setOperators(self.A.mat)
++            self._matrix_values = gpu.coefficient_values(self.a, self.bcs)
++
++    def _forward(self):
++        self._ensure_matrix()
++        if not (gpu.CONFIG["affine_replay"] and self._affine_L.replay(self.b.vector)):
++            self.asm.assemble_vector(self.cuda_L, self.b)
++            if gpu.CONFIG["affine_replay"]:
++                self._affine_L.learn(self.b.vector)        # remember these values for the replay
++        if self.bcs:
++            self.device_bcs.update()
++            if gpu.bc_values_zero(self.bcs):             # homogeneous conditions: no lifting
++                gpu.STATS["liftings_skipped"] += 1
++            else:
++                self.asm.apply_lifting(self.b, [self.cuda_a], [self.device_bcs])
++            self.asm.set_bc(self.b, bcs=self.device_bcs, V=self.u.function_space)
++        self.ksp.solve(self.b.vector, self.x)
++        n = gpu.owned(self.u.function_space)
++        self.u.x.array[:n] = self.x.getArray(readonly=True)
++        self.u.x.scatter_forward()
++
++
++    def adjoint_solver(self):
++        """``(ksp, transpose)`` that solves the adjoint system with the forward operator as it is
++        assembled now, or ``None`` if a separate adjoint operator is needed.
++
++        The adjoint operator is the transpose of the forward matrix (same Dirichlet rows and
++        columns). The forward matrix and its preconditioner / factorisation can therefore be
++        used when (1) the matrix was assembled from the coefficient values that are live now
++        (single solves; time loops whose operator does not change), and (2) the matrix is
++        symmetric (``ksp.solve``; any solver) or it is factorised by PETSc (``pc_type lu``:
++        ``ksp.solveTranspose``). cuDSS has no transposed solve, so a non-symmetric matrix
++        factorised by cuDSS gets its own adjoint factorisation."""
++        if self._own_adjoint_solver or self._matrix_values is None:
++            return None
++        if not gpu.coefficient_values_unchanged(self._matrix_values, self.a, self.bcs):
++            return None
++        state = self.A.mat.stateGet()
++        if self._symmetric[0] != state:
++            self._symmetric = (state, gpu.is_symmetric(self.A.mat))
++        if self._symmetric[1]:
++            return self.ksp, False
++        if self._petsc_lu:
++            return self.ksp, True
++        return None
++
++
++class NonlinearProblem:
++    """Solve F(u; v) = 0 with Newton's method on the GPU (cuDOLFINx assembly of residual and
++    Jacobian, PETSc CUDA KSP for the Newton steps) and record the solve on the tape.
++
++    Args:
++        F: residual form. J: Jacobian form (default derivative(F, u)).
++        u: solution / initial guess (:class:`cudolfinx.adjoint.Function`).
++        bcs: Dirichlet conditions.
++        petsc_options: KSP options for the linear solves inside Newton.
++        newton_options: dict with rtol (1e-9), atol (1e-10), max_it (50), relaxation (1.0),
++            report (False).
++        adjoint_petsc_options: KSP options for the adjoint solves.
++    """
++
++    def __init__(self, F: ufl.Form, u: Function, bcs=None, J: ufl.Form | None = None, *,
++                 petsc_options: dict | None = None, newton_options: dict | None = None,
++                 adjoint_petsc_options: dict | None = None, petsc_options_prefix: str | None = None,
++                 cuda_jit_options: dict | None = None):
++        if not isinstance(u, Function):
++            raise TypeError("u must be a cudolfinx.adjoint.Function")
++        self.F, self.u = F, u
++        self.J = J if J is not None else ufl.derivative(F, u, ufl.TrialFunction(u.function_space))
++        self.bcs = list(bcs or [])
++        self.jit_options = cuda_jit_options or {}
++        self.newton = {"rtol": 1e-9, "atol": 1e-10, "max_it": 50, "relaxation": 1.0, "report": False}
++        self.newton.update(newton_options or {})
++        self.asm = gpu.assembler()
++        self.cuda_F = gpu.cuda_form(F, self.jit_options)
++        self.cuda_J = gpu.cuda_form(self.J, self.jit_options)
++        self.A = self.asm.create_matrix(self.cuda_J)
++        self.b = self.asm.create_vector(self.cuda_F)
++        self.dx = self.b.vector.duplicate()
++        self.device_bcs = gpu.pack_bcs(self.bcs) if self.bcs else []
++        comm = u.function_space.mesh.comm
++        self.ksp = gpu.make_ksp(comm, petsc_options, petsc_options_prefix or _prefix("cuadj_newton_"))
++        if gpu.wants_cudss(petsc_options):
++            from cudolfinx import cudss
++            self._cudss = cudss.attach(self.ksp, self.A, **cudss.options_kwargs(petsc_options))
++        self.adjoint_options = adjoint_petsc_options or petsc_options or _DEFAULT_ADJOINT_OPTIONS
++        self.adjoint_prefix = _prefix("cuadj_newton_adjoint_")
++        self.iterations = 0
++        self._cuda_u = CUDAVector(self.asm._ctx, u.x.petsc_vec, include_ghosts=True)
++
++    def solve(self, annotate=None) -> Function:
++        annotate = annotate_tape({"annotate": annotate} if annotate is not None else None)
++        if annotate:
++            block = SolveBlock(self, self.F, self.u, self.bcs, linear=False)
++            get_working_tape().add_block(block)
++        self._forward()
++        return self.u
++
++    def _residual_norm(self) -> float:
++        """Assemble F(u) with the boundary rows replaced by (u - g) (DOLFINx's convention for
++        Newton residuals), on the GPU; returns its 2-norm."""
++        self._cuda_u.to_device()
++        self.asm.assemble_vector(self.cuda_F, self.b)
++        if self.bcs:
++            self.asm.apply_lifting(self.b, [self.cuda_J], [self.device_bcs], x0=[self._cuda_u], scale=-1.0)
++            self.asm.set_bc(self.b, bcs=self.device_bcs, V=self.u.function_space, x0=self._cuda_u, scale=-1.0)
++        return self.b.vector.norm()
++
++    def _forward(self):
++        u = self.u
++        n = gpu.owned(u.function_space)
++        if self.bcs:
++            self.device_bcs.update()
++        r0 = r = self._residual_norm()
++        it = 0
++        rtol, atol, maxit, relax = self.newton["rtol"], self.newton["atol"], self.newton["max_it"], self.newton["relaxation"]
++        if self.newton["report"]:
++            print(f"  Newton iteration 0: r (abs) = {r:.3e} r (rel) = 1.000e+00", flush=True)
++        while not (r < atol or (r0 > 0 and r / r0 < rtol)) and it < maxit:
++            self.asm.assemble_matrix(self.cuda_J, self.A, bcs=self.device_bcs)
++            self.A.assemble()
++            self.A.mat.assemble()
++            self.ksp.setOperators(self.A.mat)
++            self.ksp.solve(self.b.vector, self.dx)
++            u.x.array[:n] -= relax * self.dx.getArray(readonly=True)
++            u.x.scatter_forward()
++            it += 1
++            r = self._residual_norm()
++            if self.newton["report"]:
++                print(f"  Newton iteration {it}: r (abs) = {r:.3e} r (rel) = {r / r0 if r0 > 0 else 0:.3e}", flush=True)
++        self.iterations = it
++        if not (r < atol or (r0 > 0 and r / r0 < rtol)):
++            raise RuntimeError(f"Newton solver did not converge in {it} iterations (residual {r:.3e})")
+diff --git a/python/cudolfinx/adjoint/timeloop.py b/python/cudolfinx/adjoint/timeloop.py
+new file mode 100644
+index 0000000..72e9cfc
+--- /dev/null
++++ b/python/cudolfinx/adjoint/timeloop.py
+@@ -0,0 +1,333 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""A whole linear, constant-operator time loop as ONE tape block, run on the GPU.
++
++    for n in range(N):                      # the usual pattern: 2N tape blocks, a host copy and
++        problem.solve()                     # a checkpoint per step, a Python-level adjoint
++        ad.assign(c_n, c)                   # replay of every block
++    ->
++    ad.linear_time_loop(problem, c_n, N)    # one block; the states stay on the device
++
++Requirements (checked): ``problem`` is a :class:`LinearProblem` for ``c`` whose bilinear form
++does not contain ``c_n``, whose linear form is affine in ``c_n``, and whose Dirichlet values are
++not recorded Functions; the other coefficients and Constants are constant during the loop.
++
++Forward, with Z the projection that zeroes the Dirichlet rows and D = ∂F/∂c_n
++(F = a(c) - L(c_n)):
++
++    x_0 = c_n,   A x_{k+1} = v0 - Z D x_k,   v0 = L(c_n = 0) with lifting and Dirichlet values
++
++one sparse matrix-vector product, one vector update and one solve per step, all on CUDA
++vectors; the trajectory x_0 .. x_N is kept on the device (it is needed by the gradient with
++respect to coefficients the step depends on through the states, e.g. a velocity field).
++
++Adjoint, for the input y_N = dJ/dx_N (sum over the two outputs c and c_n):
++
++    λ_k = A^{-T} Z y_{k+1},   y_k = -D^T λ_k,
++    dJ/dm += -(∂F/∂m)^T λ_k  at (c, c_n) = (x_{k+1}, x_k)      for every other dependency m
++
++with the gradient forms assembled on the device from coefficients copied device-to-device,
++and accumulated on the device. Constants: the DG0 stand-in of gpu.constant_derivative,
++accumulated over the steps and summed once.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++from petsc4py import PETSc
++
++import ufl
++from dolfinx import fem
++from pyadjoint import Block
++from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
++
++from cudolfinx.la import CUDAVector
++
++from . import gpu
++from .types import Constant, Function, from_cpp
++
++STATS = {"fused_loops": 0, "fused_forward_steps": 0, "fused_adjoint_steps": 0}
++
++
++def _owned(V):
++    return gpu.owned(V)
++
++
++class _Loop:
++    """The device-side machinery of one (problem, c_n) pair: matrices, vectors, forms."""
++
++    def __init__(self, problem, c_n):
++        self.P, self.c_n = problem, c_n
++        self.c = problem.u
++        self.V = self.c.function_space
++        P = problem
++        if any(c is c_n for c in P.a.coefficients()):
++            raise ValueError("linear_time_loop: the bilinear form must not depend on c_n")
++        for bc in P.bcs:
++            if isinstance(from_cpp(bc.g) if not isinstance(bc.g, Function) else bc.g, Function):
++                raise NotImplementedError("linear_time_loop: Dirichlet values that are recorded Functions")
++        trial = ufl.TrialFunction(self.V)
++        self.D_form = ufl.derivative(P.F, c_n, trial)                 # = -∂L/∂c_n, constant in c_n
++        from .affine import _is_zero_form
++        if not _is_zero_form(ufl.derivative(self.D_form, c_n, trial)):
++            raise ValueError("linear_time_loop: the linear form must be affine in c_n")
++        self.ctx = P.asm._ctx
++        tmpl = P.x
++        self.mask = tmpl.duplicate()
++        m = np.ones(_owned(self.V))
++        if P.bcs:
++            m[P_bc_dofs(P)] = 0.0
++        self.mask.setArray(m)
++        self.v0, self.r, self.rhs = tmpl.duplicate(), tmpl.duplicate(), tmpl.duplicate()
++        self.traj: list[PETSc.Vec] = []
++        self.traj_values = None
++        # three coefficient carriers for the per-step gradient forms (device-to-device)
++        self.lam = gpu.work_function(self.V, "loop_adjoint")
++        self.carrier = {}
++        for f in (self.c, self.c_n, self.lam):
++            v = tmpl.duplicate()
++            self.carrier[id(f)] = (f, v, CUDAVector(self.ctx, v))
++
++    # -------------------------------------------------------------- operators at live values
++    def operators(self):
++        P = self.P
++        P._ensure_matrix()
++        Dm, D = gpu.assemble_matrix(self.D_form, [], P.jit_options)
++        self.D = D
++        # v0 = L(c_n = 0) with lifting and Dirichlet values, exactly as LinearProblem._forward
++        with gpu.substituted({self.c_n: np.zeros_like(self.c_n.x.array)}):
++            P.asm.assemble_vector(P.cuda_L, P.b)
++            if P.bcs:
++                P.device_bcs.update()
++                if not gpu.bc_values_zero(P.bcs):
++                    P.asm.apply_lifting(P.b, [P.cuda_a], [P.device_bcs])
++                P.asm.set_bc(P.b, bcs=P.device_bcs, V=self.V)
++            P.b.vector.copy(self.v0)
++
++    def forward(self, steps):
++        """Run the loop from the live c_n; keeps the trajectory; returns the final state (host)."""
++        self.operators()
++        n = _owned(self.V)
++        for v in self.traj:
++            v.destroy()
++        x = self.P.x.duplicate()
++        x.setArray(self.c_n.x.array[:n])
++        self.traj = [x]
++        ksp = self.P.ksp
++        for k in range(steps):
++            self.D.mult(x, self.r)                       # r = D x_k
++            self.r.pointwiseMult(self.r, self.mask)      # Z D x_k
++            self.v0.copy(self.rhs)
++            self.rhs.axpy(-1.0, self.r)                  # v0 - Z D x_k
++            xn = x.duplicate()
++            ksp.solve(self.rhs, xn)
++            self.traj.append(xn)
++            x = xn
++        STATS["fused_forward_steps"] += steps
++        self.traj_values = self.snapshot()
++        return x.getArray(readonly=True).copy()
++
++    def snapshot(self):
++        """Live values of everything the trajectory depends on (not the evolving state c)."""
++        out = []
++        for f in tuple(self.P.F.coefficients()) + tuple(self.P.F.constants()):
++            if f is self.c:
++                continue
++            out.append(f.x.array.copy() if isinstance(f, fem.Function) else np.array(f.value, copy=True))
++        return out
++
++    # -------------------------------------------------------------- adjoint
++    def _set_carriers(self, cf, pairs):
++        for f, vec in pairs:
++            ff, carrier, cv = self.carrier[id(f)]
++            vec.copy(carrier)
++            cf.update_coefficient_from_vector(f, cv)
++
++    def adjoint(self, y_host, deps, steps):
++        """deps: list of (object, kind) with kind in {"function", "constant"}; returns
++        {id(object): gradient array} and the adjoint w.r.t. the initial c_n."""
++        P = self.P
++        n = _owned(self.V)
++        dFdu_adj = gpu.derived(P.F, "dFdu_adj", lambda: ufl.adjoint(ufl.derivative(P.F, self.c, ufl.TrialFunction(self.V))))
++        fwd = P.adjoint_solver() if gpu.CONFIG["reuse_forward_operator"] else None
++        if fwd is not None:
++            ksp_adj, transpose = fwd
++        else:
++            _, ksp_adj, _ = gpu.adjoint_operator(dFdu_adj, P.bcs, P.adjoint_options, P.adjoint_prefix, P.jit_options)
++            transpose = False
++        y = self.P.x.duplicate()
++        y.setArray(np.asarray(y_host)[:n])
++        lam = y.duplicate()
++        # gradient forms and accumulators
++        terms = []
++        for obj, kind in deps:
++            if kind == "function":
++                form = gpu.derived(P.F, ("loop_dFdm_adj_lam", id(obj)), lambda obj=obj: ufl.action(
++                    ufl.adjoint(ufl.derivative(P.F, obj, ufl.TrialFunction(obj.function_space))), self.lam))
++                stand_in = None
++            else:
++                stand_in = gpu.constant_stand_in(obj, self.V.mesh)
++                pairing = gpu.derived(P.F, "loop_pairing", lambda: ufl.action(P.F, self.lam))
++                form = gpu.derived(pairing, ("d_constant", id(obj)), lambda obj=obj, s=stand_in, pr=pairing: ufl.derivative(
++                    ufl.replace(pr, {obj: s}), s, ufl.TestFunction(s.function_space)))
++            cf = gpu.cuda_form(form, P.jit_options)
++            cf.to_device()                                  # every coefficient at the recorded values
++            P.asm.pack_coefficients(cf)
++            vec = P.asm.create_vector(cf)
++            acc = vec.vector.duplicate()
++            acc.set(0.0)
++            # the compiled form keeps only the coefficients that survive differentiation
++            from ufl.algorithms import expand_derivatives
++            used = expand_derivatives(form).coefficients()
++            present = [f for f in (self.c, self.c_n, self.lam) if any(f is g for g in used)]
++            terms.append((obj, kind, form, cf, vec, acc, present))
++        for k in range(steps - 1, -1, -1):
++            y.pointwiseMult(y, self.mask)                   # λ = 0 on Dirichlet dofs
++            if transpose:
++                ksp_adj.solveTranspose(y, lam)
++            else:
++                ksp_adj.solve(y, lam)
++            src = {id(self.c): self.traj[k + 1], id(self.c_n): self.traj[k], id(self.lam): lam}
++            for obj, kind, form, cf, vec, acc, present in terms:
++                self._set_carriers(cf, [(f, src[id(f)]) for f in present])
++                P.asm.assemble_vector(cf, vec, coeffs=present, copy_to_device=False)
++                acc.axpy(-1.0, vec.vector)
++            self.D.multTranspose(lam, y)                    # y_k = -D^T λ_k
++            y.scale(-1.0)
++        STATS["fused_adjoint_steps"] += steps
++        out = {}
++        for obj, kind, form, cf, vec, acc, present in terms:
++            a = acc.getArray(readonly=True).copy()
++            if kind == "constant":
++                ncomp = max(1, int(np.prod(np.shape(obj.value))) or 1)
++                a = np.asarray(self.V.mesh.comm.allreduce(a.reshape(-1, ncomp).sum(axis=0))).reshape(np.shape(obj.value))
++            out[id(obj)] = a
++            acc.destroy()
++        y_initial = y.getArray(readonly=True).copy()
++        for v in (y, lam):
++            v.destroy()
++        return out, y_initial
++
++
++def P_bc_dofs(P):
++    return np.unique(np.concatenate([bc.dof_indices()[0] for bc in P.bcs])) if P.bcs else np.zeros(0, np.int32)
++
++
++class LinearTimeLoopBlock(Block):
++    def __init__(self, loop: _Loop, steps: int):
++        super().__init__()
++        self.loop, self.steps = loop, steps
++        P = loop.P
++        self.deps = []
++        seen = set()
++        for c in tuple(P.F.coefficients()) + tuple(P.F.constants()):
++            if c is loop.c or id(c) in seen or c is loop.lam:
++                continue
++            if isinstance(c, (Function, Constant)):
++                seen.add(id(c))
++                self.add_dependency(c, no_duplicates=True)
++                self.deps.append(c)
++        if loop.c_n not in self.deps:
++            self.add_dependency(loop.c_n, no_duplicates=True)
++            self.deps.append(loop.c_n)
++
++    def _values(self, inputs):
++        vals = {}
++        for bv, inp in zip(self.get_dependencies(), inputs):
++            obj = bv.output
++            if isinstance(obj, fem.Function):
++                vals[obj] = inp.x.array if isinstance(inp, fem.Function) else np.asarray(inp)
++            else:
++                vals[obj] = inp.value if isinstance(inp, fem.Constant) else np.asarray(inp)
++        vals[self.loop.c] = self.loop.c.x.array.copy()     # restored after a replay
++        return vals
++
++    def _trajectory_current(self, values):
++        L = self.loop
++        if L.traj_values is None or len(L.traj) != self.steps + 1:
++            return False
++        with gpu.substituted(values):
++            now = L.snapshot()
++        return len(now) == len(L.traj_values) and all(
++            a.shape == b.shape and np.array_equal(a, b) for a, b in zip(now, L.traj_values))
++
++    def prepare_evaluate_adj(self, inputs, adj_inputs, relevant_dependencies):
++        L = self.loop
++        values = self._values(inputs)
++        n = _owned(L.V)
++        y = np.zeros(n)
++        for a in adj_inputs:
++            if a is not None:
++                y += np.asarray(a.x.array if isinstance(a, fem.Function) else a)[:n]
++        with gpu.substituted(values):
++            if not self._trajectory_current(values):
++                L.forward(self.steps)                       # the tape was replayed elsewhere
++            else:
++                L.operators()
++            deps = []
++            for idx, bv in relevant_dependencies:
++                obj = bv.output
++                if obj is L.c_n:
++                    continue
++                deps.append((obj, "function" if isinstance(obj, fem.Function) else "constant"))
++            grads, y0 = L.adjoint(y, deps, self.steps)
++        grads[id(L.c_n)] = y0
++        return grads
++
++    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
++        return prepared.get(id(block_variable.output))
++
++    def prepare_recompute_component(self, inputs, relevant_outputs):
++        values = self._values(inputs)
++        with gpu.substituted(values):
++            with stop_annotating():
++                xN = self.loop.forward(self.steps)
++        return xN
++
++    def recompute_component(self, inputs, block_variable, idx, prepared):
++        out = block_variable.output._ad_init_zero()
++        n = _owned(self.loop.V)
++        out.x.array[:n] = prepared
++        out.x.scatter_forward()
++        return out
++
++
++_LOOPS: dict = {}
++
++
++def linear_time_loop(problem, c_n: Function, steps: int, annotate=None) -> Function:
++    """Run ``steps`` steps of ``problem.solve(); assign(c_n, problem.u)`` on the GPU as one
++    tape block. Afterwards ``problem.u`` and ``c_n`` both hold the final state (as after the
++    explicit loop). Returns ``problem.u``."""
++    key = (id(problem), id(c_n))
++    hit = _LOOPS.get(key)
++    if hit is None:
++        hit = (_Loop(problem, c_n), problem, c_n)
++        _LOOPS[key] = hit
++    loop = hit[0]
++    annotate = annotate_tape({"annotate": annotate} if annotate is not None else None)
++    block = None
++    if annotate:
++        block = LinearTimeLoopBlock(loop, steps)
++        get_working_tape().add_block(block)
++    xN = loop.forward(steps)
++    n = _owned(loop.V)
++    for f in (loop.c, c_n):
++        f.x.array[:n] = xN
++        f.x.scatter_forward()
++    if annotate:
++        block.add_output(loop.c.create_block_variable())
++        block.add_output(c_n.create_block_variable())
++    STATS["fused_loops"] += 1
++    return loop.c
++
++
++def clear():
++    for loop, _, _ in _LOOPS.values():
++        for v in loop.traj:
++            v.destroy()
++        loop.traj = []
++    _LOOPS.clear()
+diff --git a/python/cudolfinx/adjoint/types.py b/python/cudolfinx/adjoint/types.py
+new file mode 100644
+index 0000000..7928509
+--- /dev/null
++++ b/python/cudolfinx/adjoint/types.py
+@@ -0,0 +1,279 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""pyadjoint-overloaded DOLFINx types.
++
++``Function`` and ``Constant`` behave exactly like their DOLFINx counterparts; in addition
++they can be recorded on the pyadjoint tape as dependencies and outputs of GPU solves and
++functionals (see :mod:`cudolfinx.adjoint.solving`, :mod:`cudolfinx.adjoint.assembly`).
++
++Checkpoints are host-side copies (a Function / Constant copy), so the tape never holds GPU
++memory. Riesz representation of gradients is l2 (the dual vector
++is returned as a Function with the same dof values), which matches dolfin-adjoint's default.
++"""
++
++from __future__ import annotations
++
++import weakref
++
++import numpy as np
++
++from pyadjoint.overloaded_type import (
++    FloatingType,
++    OverloadedType,
++    create_overloaded_object,
++    register_overloaded_type,
++)
++
++from dolfinx import fem
++
++
++@register_overloaded_type
++class Function(fem.Function, FloatingType):
++    """A :class:`dolfinx.fem.Function` that pyadjoint can record.
++
++    The DOLFINx class is the first base on purpose: FFCx finds the code-generation handler of
++    a terminal by following ``type(t).__bases__[0]`` upwards."""
++
++    def __init__(self, *args, **kwargs):
++        # pyadjoint's OverloadedType does not chain to the next base class, so the
++        # DOLFINx constructor is called explicitly (as dolfin-adjoint does).
++        FloatingType.__init__(
++            self,
++            block_class=kwargs.pop("block_class", None),
++            _ad_floating_active=kwargs.pop("_ad_floating_active", False),
++            _ad_args=kwargs.pop("_ad_args", []),
++            output_block_class=kwargs.pop("output_block_class", None),
++            _ad_output_args=kwargs.pop("_ad_output_args", []),
++            _ad_outputs=kwargs.pop("_ad_outputs", []),
++        )
++        kwargs.pop("annotate", None)
++        fem.Function.__init__(self, *args, **kwargs)
++        # DOLFINx hands out the C++ object in places (e.g. DirichletBC.g); remember the wrapper
++        _CPP_TO_PY[id(self._cpp_object)] = weakref.ref(self)
++
++    # -- construction from a plain dolfinx Function -------------------------------
++    @classmethod
++    def _ad_init_object(cls, obj):
++        f = cls(obj.function_space, name=obj.name, dtype=obj.x.array.dtype)
++        f.x.array[:] = obj.x.array
++        return f
++
++    def _ad_init_object(self, obj):  # noqa: F811  (pyadjoint calls it on the instance with a dual value)
++        """Function from a dolfinx Function or from an array of dof values (an adjoint value)."""
++        if isinstance(obj, fem.Function):
++            f = Function(obj.function_space, name=obj.name, dtype=obj.x.array.dtype)
++            f.x.array[:] = obj.x.array
++            return f
++        f = Function(self.function_space, dtype=self.x.array.dtype)
++        n = min(f.x.array.size, np.asarray(obj).size)
++        f.x.array[:n] = np.asarray(obj).ravel()[:n]
++        f.x.scatter_forward()
++        return f
++
++    def copy(self, *, deepcopy: bool = True) -> Function:  # noqa: D102
++        f = Function(self.function_space, name=self.name, dtype=self.x.array.dtype)
++        f.x.array[:] = self.x.array
++        return f
++
++    # -- pyadjoint interface ---------------------------------------------------------
++    def _ad_will_add_as_dependency(self):
++        """Called when this Function becomes a block dependency. pyadjoint keeps an existing
++        checkpoint (overwrite=False); if the live values were changed in place since it was
++        taken (a control updated with g.x.array[:] = ... between two tapes, the usual
++        optimisation-loop pattern), the checkpoint is refreshed so that the tape records what
++        the forward solve actually used."""
++        FloatingType._ad_will_add_as_dependency(self)
++        bv = self.block_variable
++        ck = bv.checkpoint
++        if isinstance(ck, fem.Function) and ck is not self and (
++                ck.x.array.shape != self.x.array.shape or not np.array_equal(ck.x.array, self.x.array)):
++            bv._checkpoint = self._ad_create_checkpoint()
++            return True
++        return None
++
++    def _ad_init_zero(self, dual=False):
++        return Function(self.function_space, dtype=self.x.array.dtype)
++
++    def _ad_convert_riesz(self, value, riesz_map=None):
++        if value is None:
++            return self._ad_init_zero()
++        out = Function(self.function_space, dtype=self.x.array.dtype)
++        out.x.array[:] = np.asarray(value if not isinstance(value, fem.Function) else value.x.array)
++        return out
++
++    def _ad_create_checkpoint(self):
++        # pyadjoint stores whatever recompute_component returns as the checkpoint and hands it
++        # back through _ad_restore_at_checkpoint, so checkpoints are Functions (copies), as in
++        # dolfin-adjoint; the live object is never touched.
++        return self.copy()
++
++    def _ad_restore_at_checkpoint(self, checkpoint):
++        if isinstance(checkpoint, fem.Function):
++            return checkpoint
++        f = Function(self.function_space, name=self.name, dtype=self.x.array.dtype)
++        f.x.array[:] = checkpoint
++        return f
++
++    def _ad_mul(self, other):
++        out = self.copy()
++        out.x.array[:] *= other
++        return out
++
++    def _ad_imul(self, other):
++        self.x.array[:] *= other
++        return self
++
++    def _ad_add(self, other):
++        out = self.copy()
++        out.x.array[:] += _array(other)
++        return out
++
++    def _ad_iadd(self, other):
++        self.x.array[:] += _array(other)
++        return self
++
++    def _ad_dot(self, other, options=None):
++        comm = self.function_space.mesh.comm
++        n = self.x.index_map.size_local * self.x.block_size
++        local = float(np.dot(self.x.array[:n], _array(other)[:n]))
++        return comm.allreduce(local, op=_MPI().SUM)
++
++    @staticmethod
++    def _ad_assign_numpy(dst, src, offset):
++        n = dst.x.index_map.size_local * dst.x.block_size
++        dst.x.array[:n] = src[offset:offset + n]
++        dst.x.scatter_forward()
++        return dst, offset + n
++
++    @staticmethod
++    def _ad_to_list(m):
++        n = m.x.index_map.size_local * m.x.block_size
++        return m.x.array[:n].tolist()
++
++    def _ad_copy(self):
++        return self.copy()
++
++    def _ad_dim(self):
++        return self.x.index_map.size_global * self.x.block_size
++
++    def _ad_str(self):
++        return str(self.x.array)
++
++
++@register_overloaded_type
++class Constant(fem.Constant, OverloadedType):
++    """A :class:`dolfinx.fem.Constant` that pyadjoint can record."""
++
++    def __init__(self, domain, c, **kwargs):
++        OverloadedType.__init__(self)
++        fem.Constant.__init__(self, domain, c)
++
++    def _ad_init_object(self, obj):
++        """Constant from a Constant or from an array / scalar (an adjoint value)."""
++        if isinstance(obj, fem.Constant):
++            return Constant(obj.domain, np.array(obj.value, copy=True))
++        return Constant(self.domain, np.array(obj, dtype=self.value.dtype).reshape(self.value.shape))
++
++    def _ad_will_add_as_dependency(self):
++        OverloadedType._ad_will_add_as_dependency(self)
++        bv = self.block_variable
++        ck = bv.checkpoint
++        if isinstance(ck, fem.Constant) and ck is not self and not np.array_equal(np.asarray(ck.value), np.asarray(self.value)):
++            bv._checkpoint = self._ad_create_checkpoint()
++            return True
++        return None
++
++    def _ad_init_zero(self, dual=False):
++        return Constant(self.domain, np.zeros_like(self.value))
++
++    def _ad_convert_riesz(self, value, riesz_map=None):
++        if value is None:
++            return self._ad_init_zero()
++        return Constant(self.domain, np.array(value, dtype=self.value.dtype).reshape(self.value.shape))
++
++    def _ad_create_checkpoint(self):
++        return Constant(self.domain, np.array(self.value, copy=True))
++
++    def _ad_restore_at_checkpoint(self, checkpoint):
++        if isinstance(checkpoint, fem.Constant):
++            return checkpoint
++        return Constant(self.domain, np.array(checkpoint, copy=True))
++
++    def _ad_mul(self, other):
++        return Constant(self.domain, self.value * other)
++
++    def _ad_imul(self, other):
++        self.value = self.value * other
++        return self
++
++    def _ad_add(self, other):
++        return Constant(self.domain, self.value + _value(other))
++
++    def _ad_iadd(self, other):
++        self.value = self.value + _value(other)
++        return self
++
++    def _ad_dot(self, other, options=None):
++        return float(np.sum(self.value * _value(other)))
++
++    @staticmethod
++    def _ad_assign_numpy(dst, src, offset):
++        n = dst.value.size
++        dst.value = np.array(src[offset:offset + n]).reshape(dst.value.shape)
++        return dst, offset + n
++
++    @staticmethod
++    def _ad_to_list(m):
++        return np.asarray(m.value).ravel().tolist()
++
++    def _ad_copy(self):
++        return Constant(self.domain, np.array(self.value, copy=True))
++
++    def _ad_dim(self):
++        return int(np.asarray(self.value).size)
++
++    @property
++    def domain(self):
++        """The mesh (or UFL domain) the Constant was created on."""
++        return self._domain
++
++
++# dolfinx.fem.Constant does not keep the mesh it was created on; remember it so that
++# copies (checkpoints, zeros, Riesz representers) can be made.
++_orig_constant_init = fem.Constant.__init__
++
++
++def _constant_init(self, domain, c):
++    _orig_constant_init(self, domain, c)
++    self._domain = domain
++
++
++fem.Constant.__init__ = _constant_init
++
++
++_CPP_TO_PY: dict = {}
++
++
++def from_cpp(obj):
++    """The Python Function wrapping a C++ Function object (or None)."""
++    ref = _CPP_TO_PY.get(id(obj))
++    return ref() if ref is not None else None
++
++
++def _array(other):
++    return other.x.array if isinstance(other, fem.Function) else np.asarray(other)
++
++
++def _value(other):
++    return other.value if isinstance(other, fem.Constant) else np.asarray(other)
++
++
++def _MPI():
++    from mpi4py import MPI
++    return MPI
++
++
++__all__ = ["Function", "Constant", "create_overloaded_object", "from_cpp"]
+diff --git a/python/cudolfinx/assemble.py b/python/cudolfinx/assemble.py
+index c4a5bf5..9b90ddb 100644
+--- a/python/cudolfinx/assemble.py
++++ b/python/cudolfinx/assemble.py
+@@ -54,6 +54,7 @@ class CUDAAssembler:
+         constants: list | None = None,
+         coeffs: list | None = None,
+         zero: bool = True,
++        copy_to_device: bool = True,
+     ):
+         """Assemble bilinear form into a matrix on the GPU.
+ 
+@@ -71,6 +72,9 @@ class CUDAAssembler:
+                 If not specified, all will be repacked.
+                 If an empty list is passed, no repacking will be performed.
+             zero: Whether to zero the matrix prior to assembly
++            copy_to_device: copy the (selected) coefficients from the host before packing.
++                False when their device copies are already current (e.g. updated with
++                ``CUDAForm.update_coefficient_from_vector``).
+ 
+         Returns:
+             Matrix representation of the bilinear form ``a``.
+@@ -96,9 +100,10 @@ class CUDAAssembler:
+             )
+         _bc0 = bc_collection._get_cpp_bcs(a.dolfinx_form.function_spaces[0])
+         _bc1 = bc_collection._get_cpp_bcs(a.dolfinx_form.function_spaces[1])
+-        # For now always re-copy to device on assembly
+-        # This assumes something has changed on the host
+-        a.to_device()
++        # coeffs=None: copy every coefficient to the device and repack (safe default);
++        # a list: copy and repack only those; []: nothing changed, assemble as is.
++        if copy_to_device:
++            a.to_device(coeffs)
+         self.pack_coefficients(a, coeffs)
+         if zero:
+             _cucpp.fem.zero_matrix_entries(self._ctx, self._cpp_object, mat._cpp_object)
+@@ -130,8 +135,8 @@ class CUDAAssembler:
+             for j, form in enumerate(row):
+                 _coeffs = coeffs[i][j] if coeffs is not None else None
+                 _constants = constants[i][j] if constants is not None else None
+-                form.to_device()
+-                self.pack_coefficients(form, coeffs)
++                form.to_device(_coeffs)
++                self.pack_coefficients(form, _coeffs)
+                 _cucpp.fem.assemble_matrix_on_device(
+                   self._ctx, self._cpp_object, form.cuda_form,
+                   form.cuda_mesh, mat._cpp_object, _bc0, _bc1
+@@ -142,7 +147,7 @@ class CUDAAssembler:
+     def assemble_vector(self,
+       b: CUDAForm,
+       vec: CUDAVector | None = None,
+-      constants=None, coeffs=None, zero=True
++      constants=None, coeffs=None, zero=True, copy_to_device: bool = True
+     ):
+         """Assemble linear form into vector on GPU.
+ 
+@@ -160,9 +165,10 @@ class CUDAAssembler:
+ 
+         if vec is None:
+             vec = self.create_vector(b)
+-        # For now always re-copy to device on assembly
+-        # This assumes something has changed on the host
+-        b.to_device()
++        # coeffs=None: copy every coefficient to the device and repack; a list: only those;
++        # []: nothing changed on the host (e.g. the coefficient was updated on the device).
++        if copy_to_device:
++            b.to_device(coeffs)
+         self.pack_coefficients(b, coeffs)
+         if zero:
+             _cucpp.fem.zero_vector_entries(self._ctx, self._cpp_object, vec._cpp_object)
+@@ -221,7 +227,7 @@ class CUDAAssembler:
+ 
+     def assemble_scalar(self,
+       b: CUDAForm,
+-      constants=None, coeffs=None
++      constants=None, coeffs=None, copy_to_device: bool = True
+     ):
+         """Assemble scalar integral on GPU.
+ 
+@@ -235,9 +241,8 @@ class CUDAAssembler:
+         if not isinstance(b, CUDAForm):
+             raise TypeError(f"Expected CUDAForm, got '{type(b)}'")
+ 
+-        # For now always re-copy to device on assembly
+-        # This assumes something has changed on the host
+-        b.to_device()
++        if copy_to_device:
++            b.to_device(coeffs)
+         self.pack_coefficients(b, coeffs)
+ 
+         return  _cucpp.fem.assemble_scalar_on_device(self._ctx, self._cpp_object, b.cuda_form,
+@@ -345,6 +350,8 @@ class CUDAAssembler:
+         cuda_mesh = None
+         _bcs = []
+         for form, bc_collection, form_coeffs in zip(a, bc_collections, coeffs):
++            if form_coeffs is not None:          # explicit list: copy those to the device first
++                form.to_device(form_coeffs)
+             self.pack_coefficients(form, form_coeffs)
+             cuda_forms.append(form.cuda_form)
+             if cuda_mesh is None:
+diff --git a/python/cudolfinx/bcs.py b/python/cudolfinx/bcs.py
+index 8ea4b01..5870a7a 100644
+--- a/python/cudolfinx/bcs.py
++++ b/python/cudolfinx/bcs.py
+@@ -16,26 +16,25 @@ class CUDADirichletBC:
+     """Represents a collection of boundary conditions."""
+ 
+     def __init__(self, ctx, bcs: list[DirichletBC]):
+-        """Initialize a collection of boundary conditions."""
++        """Initialize a collection of boundary conditions.
++
++        Device objects are built per *assembly* space on first use (:meth:`_get_cpp_bcs`),
++        each holding every condition whose space that assembly space contains. A condition
++        on a sub-space of a mixed space (``W.sub(0)``) is therefore applied when assembling
++        on ``W`` -- matching by exact function-space equality silently dropped such
++        conditions -- and an assembly space without conditions gets one cached empty
++        collection instead of a new device allocation per call.
++        """
+         self.bcs = bcs
++        self._cpp_bcs = [bc._cpp_object for bc in bcs]
+         self._function_spaces = []
+-        self._bc_lists = []
+         self._device_bcs = []
+         self._ctx = ctx
+ 
++        # eager groups for the spaces the conditions were created on (the common case:
++        # the assembly space itself)
+         for bc in bcs:
+-            V = bc.function_space
+-            try:
+-                i = self._function_spaces.index(V)
+-            except ValueError:
+-                self._function_spaces.append(V)
+-                self._bc_lists.append([])
+-                i = -1
+-            self._bc_lists[i].append(bc._cpp_object)
+-
+-        for V, cpp_bcs in zip(self._function_spaces, self._bc_lists):
+-            _cpp_bc_obj = self._make_device_bc(V, cpp_bcs)
+-            self._device_bcs.append(_cpp_bc_obj)
++            self._get_cpp_bcs(bc.function_space)
+ 
+     def _make_device_bc(self,
+       V: typing.Union[_cpp.fem.FunctionSpace_float32, _cpp.fem.FunctionSpace_float64],
+@@ -52,15 +51,19 @@ class CUDADirichletBC:
+     def _get_cpp_bcs(self,
+       V: typing.Union[_cpp.fem.FunctionSpace_float32, _cpp.fem.FunctionSpace_float64]
+     ):
+-        """Get cpp CUDADirichletBC object."""
++        """Get the cpp CUDADirichletBC object for assembly on space ``V`` (all conditions on
++        ``V`` or on one of its sub-spaces), creating and caching it on first request."""
++        if hasattr(V, "_cpp_object"):
++            V = V._cpp_object
+         # Use this to avoid needing hashes (which might not be supported)
+         # Usually there will be a max of two function spaces associated with a set of bcs
+-        try:
+-            i = self._function_spaces.index(V)
+-            return self._device_bcs[i]
+-        except ValueError:
+-            # return empty collection
+-            return self._make_device_bc(V, [])
++        for Vi, dev in zip(self._function_spaces, self._device_bcs):
++            if Vi == V:
++                return dev
++        dev = self._make_device_bc(V, [bc for bc in self._cpp_bcs if V.contains(bc.function_space)])
++        self._function_spaces.append(V)
++        self._device_bcs.append(dev)
++        return dev
+ 
+     def update(self, bcs: typing.Optional[list[DirichletBC]] = None):
+         """Update a subset of the boundary conditions.
+diff --git a/python/cudolfinx/cudss.py b/python/cudolfinx/cudss.py
+new file mode 100644
+index 0000000..a534b28
+--- /dev/null
++++ b/python/cudolfinx/cudss.py
+@@ -0,0 +1,232 @@
++# Copyright (C) 2026
++#
++# This file is part of cuDOLFINX
++#
++# SPDX-License-Identifier:    LGPL-3.0-or-later
++"""NVIDIA cuDSS (GPU sparse direct solver) as a PETSc preconditioner for cuDOLFINx matrices.
++
++PETSc in this environment has no cuDSS; this module binds libcudss with ctypes and plugs it
++into a PETSc KSP as a ``python`` preconditioner: ``preonly`` + exact LU on the GPU.
++
++    from cudolfinx import cudss
++    cudss.attach(ksp, cuda_matrix)        # cuda_matrix: cudolfinx.la.CUDAMatrix
++
++The factorisation is done once per matrix *values* (PETSc's object state is checked), so a
++time loop with a constant matrix pays one factorisation and then two triangular solves per
++step, entirely on the GPU; the right-hand side and solution never leave the device.
++
++Requires libcudss.so.0 (pip wheel ``nvidia-cudss-cu12``, or the directory in CUDSS_LIB_DIR).
++"""
++
++from __future__ import annotations
++
++import ctypes
++import glob
++import os
++
++import numpy as np
++from petsc4py import PETSc
++
++# enums from cudss_data_types.h (0.8) / library_types.h
++CUDA_R_32F, CUDA_R_64F, CUDA_R_32I = 0, 1, 10
++CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO = 0, 0, 0
++MTYPES = {"general": 0, "symmetric": 1, "spd": 3}        # cudssMatrixType_t
++MVIEWS = {"full": 0, "lower": 1, "upper": 2}             # cudssMatrixViewType_t
++CUDSS_LAYOUT_COL_MAJOR = 0
++PHASE_ANALYSIS, PHASE_FACTORIZATION, PHASE_REFACTORIZATION = 3, 4, 8
++PHASE_SOLVE = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9)
++CONFIG_MATCHING_ALG = 3
++DATA_INFO = 0
++_STATUS = ["SUCCESS", "NOT_INITIALIZED", "ALLOC_FAILED", "INVALID_VALUE",
++           "NOT_SUPPORTED", "EXECUTION_FAILED", "INTERNAL_ERROR", "IR_FAILED"]
++
++_lib = None
++_cudart = None
++# diagnostics: refactorise at every PC set-up / apply regardless of the matrix state counter
++ALWAYS_REFACTOR = os.environ.get("CUDOLFINX_CUDSS_ALWAYS_REFACTOR", "0") == "1"
++
++
++def _find_lib():
++    cands = []
++    if os.environ.get("CUDSS_LIB_DIR"):
++        cands += glob.glob(os.path.join(os.environ["CUDSS_LIB_DIR"], "libcudss.so*"))
++    try:
++        import site
++        for d in site.getsitepackages() + [site.getusersitepackages()]:
++            cands += glob.glob(os.path.join(d, "nvidia", "*", "lib", "libcudss.so.0"))
++    except Exception:
++        pass
++    cands += glob.glob("/usr/lib/x86_64-linux-gnu/libcudss.so*") + glob.glob("/usr/local/lib/libcudss.so*")
++    for c in cands:
++        if os.path.exists(c):
++            return c
++    raise OSError("libcudss.so.0 not found (pip install nvidia-cudss-cu12 or set CUDSS_LIB_DIR)")
++
++
++def available() -> bool:
++    try:
++        _load()
++        return True
++    except OSError:
++        return False
++
++
++def _load():
++    global _lib, _cudart
++    if _lib is None:
++        _lib = ctypes.CDLL(_find_lib())
++        try:
++            _cudart = ctypes.CDLL("libcudart.so.12")
++        except OSError:
++            _cudart = None
++    return _lib
++
++
++def _check(status, what):
++    if status != 0:
++        raise RuntimeError("cuDSS %s failed: %s" % (what, _STATUS[status] if status < len(_STATUS) else status))
++
++
++def _sync():
++    if _cudart is not None:
++        _cudart.cudaDeviceSynchronize()
++
++
++class CuDSSFactor:
++    """LU factorisation of an int32-CSR fp64 matrix living on the GPU (raw device pointers)."""
++
++    def __init__(self, row_ptr: int, col_ind: int, values: int, n: int, nnz: int, matching: bool = True,
++                 mtype: str = "general", mview: str = "full"):
++        """mtype: "general" (LU with matching, any square matrix), "symmetric" (LDL^T) or
++        "spd" (Cholesky: about half the factorisation work and memory of LU). The symmetric
++        types read the triangle named by mview from the CSR arrays ("full": the whole matrix
++        is stored, as PETSc does)."""
++        lib = _load()
++        self.n, self.nnz = n, nnz
++        self.mtype = mtype
++        matching = matching and mtype == "general"
++        self.handle, self.config, self.data = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
++        _check(lib.cudssCreate(ctypes.byref(self.handle)), "create")
++        _check(lib.cudssConfigCreate(ctypes.byref(self.config)), "config")
++        _check(lib.cudssDataCreate(self.handle, ctypes.byref(self.data)), "data")
++        if matching:                     # max-product matching + scaling: robust for saddle points
++            v = ctypes.c_int(6)          # CUDSS_MATCHING_ALG_AUTO
++            _check(lib.cudssConfigSet(self.config, CONFIG_MATCHING_ALG, ctypes.byref(v), ctypes.sizeof(v)),
++                   "config matching")
++        self.A = ctypes.c_void_p()
++        _check(lib.cudssMatrixCreateCsr(
++            ctypes.byref(self.A), ctypes.c_int64(n), ctypes.c_int64(n), ctypes.c_int64(nnz),
++            ctypes.c_void_p(row_ptr), None, ctypes.c_void_p(col_ind), ctypes.c_void_p(values),
++            CUDA_R_32I, CUDA_R_32I, CUDA_R_64F, MTYPES[mtype], MVIEWS[mview], CUDSS_BASE_ZERO),
++            "matrix csr")
++        # dense descriptors are re-pointed at the PETSc vectors' device arrays in solve()
++        self.X, self.B = ctypes.c_void_p(), ctypes.c_void_p()
++        self._dummy = np.zeros(1)
++        for M in (self.X, self.B):
++            _check(lib.cudssMatrixCreateDn(ctypes.byref(M), ctypes.c_int64(n), ctypes.c_int64(1), ctypes.c_int64(n),
++                                           ctypes.c_void_p(values), CUDA_R_64F, CUDSS_LAYOUT_COL_MAJOR),
++                   "matrix dense")
++        _sync()
++        self._exec(PHASE_ANALYSIS, "analysis")
++        self.factored = False
++
++    def _exec(self, phase, what):
++        _check(_load().cudssExecute(self.handle, phase, self.config, self.data, self.A, self.X, self.B), what)
++
++    def factorize(self):
++        _sync()
++        self._exec(PHASE_REFACTORIZATION if self.factored else PHASE_FACTORIZATION, "factorization")
++        _sync()
++        v, w = ctypes.c_int(0), ctypes.c_size_t(0)
++        _check(_load().cudssDataGet(self.handle, self.data, DATA_INFO, ctypes.byref(v), ctypes.sizeof(v),
++                                    ctypes.byref(w)), "info")
++        if v.value != 0:
++            raise RuntimeError("cuDSS factorization info = %d (singular / zero pivot)" % v.value)
++        self.factored = True
++
++    def solve(self, b_dev: int, x_dev: int):
++        """Solve A x = b for device arrays (pointers) of length n."""
++        lib = _load()
++        _check(lib.cudssMatrixSetValues(self.B, ctypes.c_void_p(b_dev)), "set B")
++        _check(lib.cudssMatrixSetValues(self.X, ctypes.c_void_p(x_dev)), "set X")
++        _sync()
++        self._exec(PHASE_SOLVE, "solve")
++        _sync()
++
++    def __del__(self):
++        try:
++            lib = _load()
++            for M in (self.A, self.X, self.B):
++                lib.cudssMatrixDestroy(M)
++            lib.cudssDataDestroy(self.handle, self.data)
++            lib.cudssConfigDestroy(self.config)
++            lib.cudssDestroy(self.handle)
++        except Exception:
++            pass
++
++
++class CuDSSPC:
++    """petsc4py ``python`` preconditioner context: exact GPU LU of a cuDOLFINx CUDAMatrix."""
++
++    def __init__(self, cuda_matrix, mtype: str = "general", mview: str = "full"):
++        self.cuda_matrix = cuda_matrix
++        self.mtype, self.mview = mtype, mview
++        self.factor = None
++        self.state = None
++
++    def _refresh(self):
++        mat = self.cuda_matrix.mat
++        state = mat.stateGet()
++        if self.factor is None:
++            rp, ci, vals, n, m, nnz = self.cuda_matrix._cpp_object.device_csr()
++            if n != m:
++                raise ValueError("cuDSS LU needs a square matrix")
++            self.factor = CuDSSFactor(rp, ci, vals, n, nnz, mtype=self.mtype, mview=self.mview)
++            self.state = None
++        if self.state != state or ALWAYS_REFACTOR:   # new values (same pattern): refactorise
++            self.factor.factorize()
++            self.state = state
++
++    def setUp(self, pc):
++        self._refresh()
++
++    def apply(self, pc, x, y):
++        self._refresh()
++        xb = x.getCUDAHandle("r")
++        yb = y.getCUDAHandle("w")
++        try:
++            self.factor.solve(int(xb), int(yb))
++        finally:
++            x.restoreCUDAHandle(xb, "r")
++            y.restoreCUDAHandle(yb, "w")
++
++
++def attach(ksp: PETSc.KSP, cuda_matrix, mtype: str = "general", mview: str = "full") -> CuDSSPC:
++    """Make `ksp` an exact GPU direct solve (preonly + cuDSS) on `cuda_matrix`.
++
++    mtype "general" is LU and always applicable; "spd" (Cholesky) and "symmetric" (LDL^T) are
++    for matrices known to have that structure (the caller's responsibility)."""
++    ctx = CuDSSPC(cuda_matrix, mtype, mview)
++    ksp.setType("preonly")
++    pc = ksp.getPC()
++    pc.setType("python")
++    pc.setPythonContext(ctx)
++    ksp.setOperators(cuda_matrix.mat)
++    return ctx
++
++
++def options_kwargs(petsc_options: dict | None) -> dict:
++    """cuDSS settings carried in a PETSc-style options dict next to ``"pc_type": "cudss"``:
++    ``"pc_cudss_mtype"``: "general" (default, LU) | "symmetric" (LDL^T) | "spd" (Cholesky)."""
++    o = petsc_options or {}
++    kw = {}
++    if "pc_cudss_mtype" in o:
++        if o["pc_cudss_mtype"] not in MTYPES:
++            raise ValueError("pc_cudss_mtype must be one of %s" % sorted(MTYPES))
++        kw["mtype"] = o["pc_cudss_mtype"]
++    return kw
++
++
++def is_cudss_option(key: str, value=None) -> bool:
++    """True for the options handled here instead of by PETSc."""
++    return (key == "pc_type" and value == "cudss") or key.startswith("pc_cudss_")
+diff --git a/python/cudolfinx/form.py b/python/cudolfinx/form.py
+index acaac6d..dd8562b 100644
+--- a/python/cudolfinx/form.py
++++ b/python/cudolfinx/form.py
+@@ -29,6 +29,35 @@ DEFAULT_CUDA_JIT_ARGS = {
+     )
+ }
+ 
++def _compute_capability() -> str:
++    """Compute capability of the device of the current CUDA context, e.g. "89" (or "unknown")."""
++    import ctypes
++    try:
++        cu = ctypes.CDLL("libcuda.so.1")
++        dev, major, minor = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
++        if cu.cuCtxGetDevice(ctypes.byref(dev)) != 0:
++            return "unknown"
++        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR / _MINOR
++        if cu.cuDeviceGetAttribute(ctypes.byref(major), 75, dev) != 0 or \
++                cu.cuDeviceGetAttribute(ctypes.byref(minor), 76, dev) != 0:
++            return "unknown"
++        return f"{major.value}{minor.value}"
++    except Exception:
++        return "unknown"
++
++
++def _kernel_cachedir(base: str) -> str:
++    """Cache directory of the compiled (PTX) kernels for the current GPU architecture.
++
++    The PTX of a kernel is specific to the compute capability it was compiled for (its
++    ``.target sm_XX`` line): a cache shared between machines with different GPUs (a cluster
++    home or scratch directory) must not hand an sm_90 kernel to an sm_89 device, which fails
++    with "ptxas fatal: SM version specified by .target is higher than default SM version"."""
++    d = Path(base) / ("cuda_sm" + _compute_capability())
++    d.mkdir(parents=True, exist_ok=True)
++    return str(d)
++
++
+ class CUDAForm:
+     """CUDA wrapper class for a dolfinx.fem.Form."""
+ 
+@@ -69,6 +98,7 @@ class CUDAForm:
+ 
+         _jit_args = DEFAULT_CUDA_JIT_ARGS.copy()
+         _jit_args.update(jit_args)
++        _jit_args["cachedir"] = _kernel_cachedir(_jit_args["cachedir"])
+ 
+         @mpi_jit_decorator
+         def do_compilation():
+@@ -78,9 +108,24 @@ class CUDAForm:
+         do_compilation(form.mesh.comm)
+ 
+ 
+-    def to_device(self):
+-        """Copy host-side coefficients and constants to the device."""
+-        self._cuda_form.to_device(self._ctx)
++    def to_device(self, coefficients: typing.Optional[list] = None):
++        """Copy host-side coefficients and constants to the device.
++
++        Args:
++            coefficients: Functions whose values changed on the host. ``None`` copies every
++                coefficient of the form (safe default); a list copies only those (the
++                constants are always refreshed); an empty list copies no coefficient.
++        """
++        if coefficients is None:
++            self._cuda_form.to_device(self._ctx)
++        else:
++            self._cuda_form.to_device(self._ctx, [c._cpp_object for c in coefficients])
++
++    def update_coefficient_from_vector(self, function, vector) -> bool:
++        """Set coefficient ``function`` from the device array of a :class:`CUDAVector`
++        (device-to-device, no host round trip). Returns False if ``function`` is not a
++        coefficient of this form. Serial / non-ghosted vectors only."""
++        return self._cuda_form.update_coefficient_from_vector(function._cpp_object, vector._cpp_object)
+ 
+     @property
+     def cuda_form(self):
+diff --git a/python/cudolfinx/petsc.py b/python/cudolfinx/petsc.py
+index b0506ef..28aa7a1 100644
+--- a/python/cudolfinx/petsc.py
++++ b/python/cudolfinx/petsc.py
+@@ -39,6 +39,7 @@ class NonlinearProblem:
+         P: ufl.Form | None = None,
+         petsc_options: dict | None = None,
+         cuda_jit_options: dict | None = None,
++        device_resident: bool = True,
+     ):
+         """Initialise the GPU nonlinear problem.
+ 
+@@ -54,6 +55,8 @@ class NonlinearProblem:
+         P: UFL form(s) for an optional preconditioner matrix
+         petsc_options: Options forwarded to the PETSc SNES solver
+         cuda_jit_options: Passed to the CUDA JIT compiler
++        device_resident: keep the Newton iterate on the GPU between SNES callbacks
++            (serial runs; automatically off with MPI). Set False to force the host path.
+         """
+         # check types of forms
+         assert isinstance(F, ufl.Form), (
+@@ -109,6 +112,20 @@ class NonlinearProblem:
+         # persistent CUDA vector wrapping u (owned + ghost DOFs) for residual assembly
+         self._cuda_u = CUDAVector(self._assembler._ctx, u.x.petsc_vec, include_ghosts=True)
+ 
++        # Device-resident mode (serial runs): SNES hands us CUDA vectors, so the iterate is
++        # copied device-to-device into the (shared) coefficient buffer of u, only u is repacked,
++        # and the other coefficients are copied to the device once, here. With ghosts (MPI)
++        # the host path with ghost updates is used instead.
++        comm = u.function_space.mesh.comm
++        self._device_resident = device_resident and comm.size == 1
++        if self._device_resident:
++            # copy AND pack every coefficient once; the callbacks then repack only u
++            for cf in (self._cuda_F, self._cuda_J, self._cuda_P):
++                if cf is not None:
++                    cf.to_device()
++                    self._assembler.pack_coefficients(cf)
++        self._x_dirty = False
++
+         # SNES object
+         self._snes: PETSc.SNES = PETSc.SNES().create(  # type: ignore[attr-defined]
+             u.function_space.mesh.comm
+@@ -155,6 +172,22 @@ class NonlinearProblem:
+         This is the vector that must be updated with the assembled residual,
+         and not the original residual vector created in ``__init__``
+         """
++        if self._device_resident:
++            # x is a CUDA vector: update the shared device copy of u straight from it (no host
++            # round trip), repack only u, and use x itself as the lifting shift vector.
++            cuda_x = CUDAVector(self._assembler._ctx, x)
++            self._cuda_F.update_coefficient_from_vector(self._u, cuda_x)
++            cuda_b = CUDAVector(self._assembler._ctx, b)
++            # u's device buffer was just updated device-to-device: repack it, do not copy the host
++            self._assembler.assemble_vector(self._cuda_F, cuda_b, zero=True, coeffs=[self._u], copy_to_device=False)
++            self._cuda_J.update_coefficient_from_vector(self._u, cuda_x)
++            self._assembler.apply_lifting(cuda_b, [self._cuda_J], [self._cuda_bcs], x0=[cuda_x],
++                                          scale=-1.0, coeffs=[[]])
++            self._assembler.set_bc(cuda_b, bcs=self._cuda_bcs, V=self._u.function_space, x0=cuda_x,
++                                   scale=-1.0)
++            self._x_dirty = True                      # host copy of u is stale until solve() returns
++            return
++
+         # copy x to u and update ghosts
+         x.copy(self._u.x.petsc_vec)
+         self._u.x.petsc_vec.ghostUpdate(
+@@ -195,6 +228,22 @@ class NonlinearProblem:
+ 
+         This is called by PETSc SNES on every Jacobian evaluation.
+         """
++        if self._device_resident:
++            cuda_x = CUDAVector(self._assembler._ctx, x)
++            self._cuda_J.update_coefficient_from_vector(self._u, cuda_x)
++            # J shares u's device buffer with F; only u must be repacked
++            self._assembler.assemble_matrix(self._cuda_J, self._cuda_A, bcs=self._cuda_bcs, coeffs=[self._u],
++                                            copy_to_device=False)
++            self._cuda_A.assemble()
++            A.assemble()
++            if self._cuda_P_mat is not None and self._cuda_P is not None:
++                self._cuda_P.update_coefficient_from_vector(self._u, cuda_x)
++                self._assembler.assemble_matrix(self._cuda_P, self._cuda_P_mat, bcs=self._cuda_bcs, coeffs=[self._u],
++                                                copy_to_device=False)
++                self._cuda_P_mat.assemble()
++                P.assemble()
++            return
++
+         # copy x to u
+         x.copy(self._u.x.petsc_vec)
+         self._u.x.petsc_vec.ghostUpdate(
+@@ -241,6 +290,13 @@ class NonlinearProblem:
+         # update BCs
+         self._cuda_bcs.update(self._bcs)
+ 
++        if self._device_resident:
++            # coefficients other than u may have changed on the host since the last solve
++            for cf in (self._cuda_F, self._cuda_J, self._cuda_P):
++                if cf is not None:
++                    cf.to_device()
++                    self._assembler.pack_coefficients(cf)
++
+         # solve
+         self._snes.solve(None, self._x)
+ 
+@@ -336,3 +392,163 @@ class NonlinearProblem:
+     def u(self) -> Function:
+         """Solution function."""
+         return self._u
++
++
++class LinearProblem:
++    """Solve a(u, v) = L(v) on the GPU: cuDOLFINx assembly, PETSc (CUDA) KSP.
++
++    Resembles :class:`dolfinx.fem.petsc.LinearProblem` and adds what time-stepping needs:
++
++    * ``constant_matrix=True``: the matrix is assembled once and the KSP keeps its operator,
++      so a direct factorisation / multigrid hierarchy is built once and reused by every solve;
++    * ``update_coefficient(f)``: copy the solution device-to-device into coefficient ``f`` of
++      the right-hand side (e.g. ``u_n``) - the host copy of ``f`` is refreshed too - so a time
++      loop never moves the state through the host;
++    * ``solve(changed=[...])``: name the coefficients that changed on the host since the last
++      solve (default: all of them are copied, the safe choice).
++
++    Example (heat equation)::
++
++        problem = LinearProblem(a, L, u, bcs=[bc], petsc_options_prefix="heat_",
++                                petsc_options={"ksp_type": "cg", "pc_type": "gamg"},
++                                constant_matrix=True)
++        for n in range(N):
++            u_D.interpolate(...)            # time-dependent boundary value (host)
++            problem.solve(changed=[])       # u_n already on the device
++            problem.update_coefficient(u_n) # u_n <- u, device-to-device
++    """
++
++    def __init__(
++        self,
++        a: ufl.Form,
++        L: ufl.Form,
++        u: Function,
++        *,
++        petsc_options_prefix: str,
++        bcs: Sequence[DirichletBC] | None = None,
++        petsc_options: dict | None = None,
++        constant_matrix: bool = False,
++        cuda_jit_options: dict | None = None,
++    ):
++        if petsc_options_prefix == "":
++            raise ValueError("PETSc options prefix cannot be empty.")
++        self._assembler = CUDAAssembler()
++        self._u = u
++        self._bcs = [] if bcs is None else list(bcs)
++        self._cuda_bcs = self._assembler.pack_bcs(self._bcs)
++        self._cuda_a: CUDAForm = _cuda_form(a, cuda_jit_args=cuda_jit_options or {})
++        self._cuda_L: CUDAForm = _cuda_form(L, cuda_jit_args=cuda_jit_options or {})
++        self._cuda_A = self._assembler.create_matrix(self._cuda_a)
++        self._cuda_b = self._assembler.create_vector(self._cuda_L)
++        self._x: PETSc.Vec = self._cuda_b.vector.duplicate()  # type: ignore[attr-defined]
++        self._cuda_x = CUDAVector(self._assembler._ctx, self._x)
++        self._constant_matrix = constant_matrix
++        self._matrix_assembled = False
++        self._serial = u.function_space.mesh.comm.size == 1
++
++        self._ksp: PETSc.KSP = PETSc.KSP().create(u.function_space.mesh.comm)  # type: ignore[attr-defined]
++        self._ksp.setOptionsPrefix(petsc_options_prefix)
++        self._cuda_A.mat.setOptionsPrefix(f"{petsc_options_prefix}A_")
++        self._cuda_b.vector.setOptionsPrefix(f"{petsc_options_prefix}b_")
++        self._x.setOptionsPrefix(f"{petsc_options_prefix}x_")
++        if petsc_options is not None:
++            opts = PETSc.Options()  # type: ignore[attr-defined]
++            opts.prefixPush(petsc_options_prefix)
++            for k, v in petsc_options.items():
++                if (k == "pc_type" and v == "cudss") or k.startswith("pc_cudss_"):
++                    continue
++                opts[k] = v
++            self._ksp.setFromOptions()
++            for k in petsc_options:
++                if (k == "pc_type" and petsc_options[k] == "cudss") or k.startswith("pc_cudss_"):
++                    continue
++                del opts[k]
++            opts.prefixPop()
++        self._ksp.setOperators(self._cuda_A.mat)
++        if (petsc_options or {}).get("pc_type") == "cudss":
++            # exact GPU direct solve (NVIDIA cuDSS), factorised once per matrix values;
++            # "pc_cudss_mtype": "spd" selects Cholesky for symmetric positive-definite matrices
++            from cudolfinx import cudss
++            self._cudss = cudss.attach(self._ksp, self._cuda_A, **cudss.options_kwargs(petsc_options))
++        elif constant_matrix:
++            self._ksp.getPC().setReusePreconditioner(True)
++        # all coefficients to the device and packed once; later solves copy/repack only what
++        # `changed` names
++        for cf in (self._cuda_a, self._cuda_L):
++            cf.to_device()
++            self._assembler.pack_coefficients(cf)
++
++    def assemble_matrix(self, changed: Sequence[Function] | None = None) -> None:
++        """(Re)assemble the matrix with the boundary conditions applied."""
++        self._assembler.assemble_matrix(self._cuda_a, self._cuda_A, bcs=self._cuda_bcs, coeffs=changed)
++        self._cuda_A.assemble()
++        self._cuda_A.mat.assemble()
++        self._matrix_assembled = True
++        if self._constant_matrix:
++            self._ksp.setOperators(self._cuda_A.mat)
++
++    def solve(self, changed: Sequence[Function] | None = None, update_host: bool = True) -> Function:
++        """Assemble the right-hand side (and the matrix unless constant and already assembled),
++        apply the Dirichlet conditions and solve.
++
++        Args:
++            changed: coefficients whose host values changed since the last solve; ``None``
++                copies all of them, ``[]`` none (their device copies are current).
++            update_host: copy the solution to ``u.x.array`` (the device copy is always current).
++        """
++        self._cuda_bcs.update(self._bcs)
++        if not (self._constant_matrix and self._matrix_assembled):
++            self.assemble_matrix(changed)
++        self._assembler.assemble_vector(self._cuda_L, self._cuda_b, zero=True, coeffs=changed)
++        if self._bcs:
++            self._assembler.apply_lifting(self._cuda_b, [self._cuda_a], [self._cuda_bcs],
++                                          coeffs=[[]] if self._constant_matrix else None)
++            self._assembler.set_bc(self._cuda_b, bcs=self._cuda_bcs, V=self._u.function_space)
++        self._ksp.solve(self._cuda_b.vector, self._x)
++        if update_host or not self._serial:
++            self._x.copy(self._u.x.petsc_vec)
++            self._u.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
++        return self._u
++
++    def update_coefficient(self, f: Function, update_host: bool = True) -> None:
++        """f <- solution, device-to-device (f must be a coefficient of a or L and live in the
++        solution's space). In parallel the host path with ghost updates is used."""
++        if self._serial:
++            done = self._cuda_L.update_coefficient_from_vector(f, self._cuda_x)
++            done = self._cuda_a.update_coefficient_from_vector(f, self._cuda_x) or done
++            if not done:
++                raise ValueError("f is not a coefficient of a or L")
++            if update_host:
++                f.x.array[:self._x.getLocalSize()] = self._x.getArray(readonly=True)
++        else:
++            self._x.copy(f.x.petsc_vec)
++            f.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
++            self._cuda_L.to_device([f])
++            self._cuda_a.to_device([f])
++
++    @property
++    def solver(self) -> PETSc.KSP:  # type: ignore[name-defined]
++        return self._ksp
++
++    @property
++    def A(self) -> PETSc.Mat:  # type: ignore[name-defined]
++        return self._cuda_A.mat
++
++    @property
++    def b(self) -> PETSc.Vec:  # type: ignore[name-defined]
++        return self._cuda_b.vector
++
++    @property
++    def x(self) -> PETSc.Vec:  # type: ignore[name-defined]
++        return self._x
++
++    @property
++    def u(self) -> Function:
++        return self._u
++
++    def __del__(self) -> None:
++        for obj in filter(None, (getattr(self, "_ksp", None), getattr(self, "_x", None))):
++            try:
++                obj.destroy()
++            except Exception:
++                pass
+diff --git a/python/cudolfinx/wrappers/fem.cpp b/python/cudolfinx/wrappers/fem.cpp
+index 557a24f..312ef57 100644
+--- a/python/cudolfinx/wrappers/fem.cpp
++++ b/python/cudolfinx/wrappers/fem.cpp
+@@ -17,6 +17,7 @@
+ #include <cudolfinx/fem/CUDADofMap.h>
+ #include <cudolfinx/fem/CUDAForm.h>
+ #include <cudolfinx/la/CUDAMatrix.h>
++#include <cudolfinx/la/CUDASeqMatrix.h>
+ #include <cudolfinx/la/CUDAVector.h>
+ #include <cudolfinx/mesh/CUDAMesh.h>
+ #include <cudolfinx/mesh/util.h>
+@@ -32,9 +33,9 @@
+ #include <nanobind/stl/function.h>
+ #include <nanobind/stl/map.h>
+ #include <nanobind/stl/pair.h>
++#include <nanobind/stl/tuple.h>
+ #include <nanobind/stl/shared_ptr.h>
+ #include <nanobind/stl/string.h>
+-#include <nanobind/stl/tuple.h>
+ #include <nanobind/stl/variant.h>
+ #include <nanobind/stl/vector.h>
+ #include <span>
+@@ -125,7 +126,36 @@ void declare_cuda_templated_objects(nb::module_& m, std::string type)
+ 	     }, nb::arg("offsets"), nb::arg("ghost_offsets"), nb::arg("restricted_inds"))
+       .def_prop_ro("compiled", &dolfinx::fem::CUDAForm<T,U>::compiled)
+       .def_prop_ro("restricted", &dolfinx::fem::CUDAForm<T,U>::restricted)
+-      .def("to_device", &dolfinx::fem::CUDAForm<T,U>::to_device);
++      .def("to_device",
++           [](dolfinx::fem::CUDAForm<T,U>& cf, const dolfinx::CUDA::Context& cuda_context) {
++             cf.to_device(cuda_context);
++           }, nb::arg("context"), "Copy all coefficients and constants to the device.")
++      .def("to_device",
++           [](dolfinx::fem::CUDAForm<T,U>& cf, const dolfinx::CUDA::Context& cuda_context,
++              std::vector<std::shared_ptr<const dolfinx::fem::Function<T,U>>>& functions) {
++             cf.to_device(cuda_context, functions);
++           }, nb::arg("context"), nb::arg("coefficients"),
++           "Copy only the given coefficients (and the constants) to the device.")
++      .def("update_coefficient_from_vector",
++           [](dolfinx::fem::CUDAForm<T,U>& cf, const dolfinx::fem::Function<T,U>& f,
++              dolfinx::la::CUDAVector& x) {
++             // owned values of x (already on the GPU) -> device buffer of coefficient f
++             CUdeviceptr src = x.values();
++             // a vector without a ghost form reports 0 ghosted values: use the owned size
++             size_t n = x.num_local_ghosted_values() > 0 ? x.num_local_ghosted_values()
++                                                          : x.num_local_values();
++             bool ok = false;
++             try {
++               ok = cf.update_coefficient_from_device(&f, src, n * sizeof(T));
++             } catch (...) {
++               x.restore_values();
++               throw;
++             }
++             x.restore_values();
++             return ok;
++           }, nb::arg("function"), nb::arg("vector"),
++           "Update coefficient `function` of this form from the device array of a CUDAVector "
++           "(device-to-device); returns False if `function` is not a coefficient of the form.");
+ 
+   pyclass_name = std::string("CUDADirichletBC_") + type;
+   nb::class_<dolfinx::fem::CUDADirichletBC<T,U>>(m, pyclass_name.c_str(),
+@@ -192,6 +222,15 @@ void declare_cuda_objects(nb::module_& m)
+             new (cumat) dolfinx::la::CUDAMatrix(cuda_context, A, false, true);
+           }, nb::arg("context"), nb::arg("A"))
+       .def("debug_dump", &dolfinx::la::CUDAMatrix::debug_dump)
++      .def("device_csr",
++           [](dolfinx::la::CUDAMatrix& cumat) {
++             // (row_ptr, column_indices, values) device pointers of the diagonal (local) block,
++             // int32 CSR, plus (rows, columns, nnz): what a GPU direct solver such as cuDSS needs
++             const dolfinx::la::CUDASeqMatrix* d = cumat.diag();
++             return std::make_tuple((std::uintptr_t) d->row_ptr(), (std::uintptr_t) d->column_indices(),
++                                    (std::uintptr_t) d->values(), d->num_local_rows(),
++                                    d->num_local_columns(), d->num_local_nonzeros());
++           }, "Device CSR arrays (pointers) of the local block.")
+       .def("to_host",
+           [](dolfinx::la::CUDAMatrix& cumat, const dolfinx::CUDA::Context& cuda_context)
+           {

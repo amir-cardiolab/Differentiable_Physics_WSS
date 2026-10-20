@@ -1,80 +1,64 @@
 # 2-D BFS — adjoint inverse on the GPU
 
 GPU version of [`../2D-BFS/Diff_Physics.py`](../2D-BFS/Diff_Physics.py): same problem,
-discretisation and objective, with the steady Navier–Stokes solve, the 4000-step
-advection–diffusion and both of their adjoints on the GPU. dolfin-adjoint still drives the
-gradient (`ReducedFunctional(J, Control(g))`).
+discretisation, objective and Adam loop, with every PDE solve and every adjoint solve on the GPU.
 
-| File | What |
-|------|------|
-| [`Diff_Physics_GPU.py`](Diff_Physics_GPU.py) | the inverse solver (configuration at the top) |
-| [`gpu_ns.py`](gpu_ns.py) | steady Navier–Stokes: GPU assembly, Newton and adjoint, as a pyadjoint `Block` |
-| [`gpu_ade.py`](gpu_ade.py) | advection–diffusion time loop and its discrete adjoint, as a pyadjoint `Block` |
-| [`gpu_fem.py`](gpu_fem.py) | P1/P2 triangle tables, quadrature and sparse-matrix maps for the GPU assembly |
-| [`gpu_cudss.py`](gpu_cudss.py) | binding to NVIDIA cuDSS (GPU sparse direct solver) |
-| [`bfs_data.py`](bfs_data.py) | finds the input data folder |
-| [`verify_gradient.py`](verify_gradient.py), [`validate_gpu.py`](validate_gpu.py), [`check_data/`](check_data/) | checks against the CPU code |
-| [`postprocess.py`](postprocess.py) | figures and metrics for finished runs |
-| [`gpu_timed_run/`](gpu_timed_run/) | timed Adam run with pre-flight checks |
-| [`Diff_Physics_CPU_reference.py`](Diff_Physics_CPU_reference.py) | unmodified copy of the CPU script (timing baseline) |
+## Libraries
 
-## Requirements
+* [DOLFINx 0.10](https://github.com/FEniCS/dolfinx) — finite-element forms and meshes
+* [cuDOLFINx 0.10](https://github.com/bpachev/cuda-dolfinx) — GPU assembly for DOLFINx, with the
+  patch in [`cudolfinx/`](cudolfinx/), which adds:
+  * `cudolfinx.adjoint`: discrete adjoints on a [pyadjoint](https://github.com/dolfin-adjoint/pyadjoint)
+    tape (the engine of dolfin-adjoint), with gradient assembly on the GPU and a fused
+    time-loop block (`linear_time_loop`) that keeps the whole time integration on the device
+  * `cudolfinx.cudss`: [NVIDIA cuDSS](https://developer.nvidia.com/cudss) as a GPU direct solver
+  * device-resident coefficients and a fix for Dirichlet conditions on mixed-space sub-spaces
+* PETSc (CUDA build) for the linear-algebra objects
 
-An NVIDIA GPU with a CUDA-12 driver (≥ 525), FEniCS 2019.1, dolfin-adjoint 2019.1, PyTorch
-with CUDA and NVIDIA cuDSS:
+## Build
 
-```bash
-conda create -n fenics_gpu -c conda-forge python=3.9 fenics=2019.1.0 "numpy<1.24" scipy matplotlib vtk
-conda activate fenics_gpu
-pip install --no-deps "git+https://github.com/dolfin-adjoint/pyadjoint.git@2019.1.0"
-pip install "torch==2.4.1" --index-url https://download.pytorch.org/whl/cu118
-pip install nvidia-cudss-cu12
-```
-
-## Data
-
-The same files as the CPU script (`mesh.xdmf/.h5`, `velocity_field.xdmf/.h5`, `C_4000.vtk` from
-the data bundle's `Results_BFS/`). They are looked up in `$BFS_DATA`, `2D-BFS-GPU/Results_BFS/`
-and `2D-BFS/Results_BFS/`, so one copy next to the CPU script serves both.
-
-## Run
+Everything runs in the official cuDOLFINx container; [`cudolfinx/build.sh`](cudolfinx/build.sh)
+applies the patch to cuDOLFINx and builds it (about 15 min):
 
 ```bash
 cd 2D-BFS-GPU
-python Diff_Physics_GPU.py                              # L-BFGS-B, 300 iterations
-OPTIMIZER=adam ITERS=200 python Diff_Physics_GPU.py     # the original Adam loop
-python verify_gradient.py                               # gradient check against dolfin-adjoint
-python postprocess.py Inverse_Results_GPU_*             # figures and metrics
+docker run --gpus all -it -v $PWD/..:/work -w /work/2D-BFS-GPU benpachev/cudolfinx:v0.10.0-cuda12.6
+bash cudolfinx/build.sh            # -> ./cudolfinx-build/
 ```
 
-Environment variables `OPTIMIZER` (lbfgs | adam), `ITERS`, `FINAL_IDX`, `DEVICE` and `OUT_DIR`
-override the configuration block.
+With Apptainer: `apptainer exec --nv docker://benpachev/cudolfinx:v0.10.0-cuda12.6 bash cudolfinx/build.sh`.
+
+## Run
+
+Data: the data bundle's `Results_BFS/` (`mesh.xdmf/.h5`, `velocity_field.xdmf/.h5`, `C_4000.vtk`),
+in `2D-BFS/` or `2D-BFS-GPU/`, or `--data DIR`.
+
+```bash
+source cudolfinx-build/env.sh
+python3 Diff_Physics_GPU.py                       # 200 epochs, N = 4000
+python3 Diff_Physics_GPU.py --epochs 1 --steps 300 --taylor   # quick check of the gradient
+```
+
+Results go to `Inverse_Results_GPU_*/`: `history.json` (per epoch), `loss_history.npy`,
+`final_flow_rate_error.txt`, `optimized_fields.xdmf`.
 
 ## Implementation
 
-| per epoch | original | this version |
-|-----------|----------|--------------|
-| NS Jacobian and residual assembly | FEniCS, CPU, every Newton step | GPU (Stokes part assembled once) |
-| NS Newton linear solves | PETSc LU, CPU | GPU, cuDSS LU (symbolic analysis once) |
-| NS adjoint | pyadjoint, CPU LU | GPU, one cuDSS solve with Jᵀ |
-| ADE matrices | FEniCS, re-assembled every time step | GPU, once per epoch |
-| ADE 4000 forward steps | GMRES + ILU, CPU | GPU, one factorisation, two triangular solves per step |
-| ADE 4000 adjoint steps | pyadjoint replays 4000 blocks, CPU | GPU, same factorisation with Aᵀ |
+| per epoch | CPU script | this version |
+|---|---|---|
+| Navier–Stokes Jacobian and residual | FEniCS, CPU | cuDOLFINx, GPU |
+| Newton linear solves and the Navier–Stokes adjoint | PETSc LU, CPU | cuDSS LU, GPU |
+| 4000 advection–diffusion steps | GMRES + ILU, matrix re-assembled every step | matrix once, cuDSS factorised once, states kept on the GPU |
+| their adjoint | dolfin-adjoint replays 8000 tape blocks | one fused tape block, on the GPU |
 
 ## Time
 
 N = 4000 (37.8k triangles, 172k Navier–Stokes and 19.3k advection–diffusion unknowns):
 
-| per epoch | original, 1 CPU core | GPU, RTX 2000 Ada |
+| per epoch | CPU script, 1 core | this version, RTX 2000 Ada |
 |---|---:|---:|
-| Navier–Stokes solve | 14.7 s | 0.6 s |
+| Navier–Stokes | 14.7 s | 0.3 s |
 | advection–diffusion, 4000 steps | 154.2 s | 1.3 s |
-| gradient | 528.4 s | 2.0 s |
+| gradient | 528.4 s | 2.3 s |
 | **epoch** | **697 s** | **3.8 s** |
-| 200 epochs | ≈ 39 h | ≈ 13 min |
-
-Plus about 15 s of one-time start-up (FEniCS compilation, GPU set-up).
-
-## Limitations
-
-Serial, 2-D triangles, Taylor–Hood P2/P1 and CG1 concentration, i.e. this problem only.
+| 200 epochs | ≈ 39 h | 13 min |

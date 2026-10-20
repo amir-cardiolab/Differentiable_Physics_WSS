@@ -17,9 +17,9 @@ Each method is applied to two geometries:
 | [`2D-BFS/`](2D-BFS/) | 2-D backward-facing step | 2-D |
 | [`Coronary Artery/`](Coronary%20Artery/) | Patient-specific coronary artery | 3-D |
 
-[`2D-BFS-GPU/`](2D-BFS-GPU/) is a GPU implementation of the 2-D `Diff_Physics` inverse
-(PyTorch + NVIDIA cuDSS): one optimisation epoch takes about 4 s on an RTX 2000 Ada instead
-of about 12 min on one CPU core.
+[`2D-BFS-GPU/`](2D-BFS-GPU/) is a GPU implementation of the 2-D `Diff_Physics` inverse built on
+DOLFINx and cuDOLFINx (with an adjoint extension, NVIDIA cuDSS solves): one optimisation epoch
+takes about 4 s on an RTX 2000 Ada instead of about 12 min on one CPU core.
 
 See the per-case READMEs for details:
 - [2D-BFS/README.md](2D-BFS/README.md)
@@ -37,12 +37,9 @@ see [Data](#data) below.
 │   ├── PINN.py                   # PINN reconstruction
 │   ├── Diff_Physics.py           # adjoint/differentiable-physics inverse (FEniCS)
 │   └── Results_BFS/   # ← input data (from the data bundle)
-├── 2D-BFS-GPU/                   # GPU version of 2D-BFS/Diff_Physics.py
-│   ├── Diff_Physics_GPU.py       # the inverse solver (Adam or L-BFGS-B)
-│   ├── gpu_ns.py, gpu_ade.py     # GPU Navier–Stokes / advection–diffusion + their adjoints
-│   ├── gpu_fem.py, gpu_cudss.py  # GPU assembly tables, cuDSS binding
-│   ├── verify_gradient.py, validate_gpu.py, check_data/   # checks against the CPU code
-│   └── gpu_timed_run/            # timed run with pre-flight checks
+├── 2D-BFS-GPU/                   # GPU version of 2D-BFS/Diff_Physics.py (DOLFINx + cuDOLFINx)
+│   ├── Diff_Physics_GPU.py       # the inverse solver
+│   └── cudolfinx/                # patch for cuDOLFINx (adjoint, cuDSS) and build script
 └── Coronary Artery/              # 3-D coronary-artery case
     ├── PINNs.py                  # PINN reconstruction
     ├── Diff_Physics.py           # adjoint/differentiable-physics inverse (FEniCS)
@@ -73,9 +70,9 @@ folders at run time and are ignored by git (see [`.gitignore`](.gitignore)).
   (CUDA GPU recommended for training).
 - **Diff_Physics scripts:** `fenics` (2019.x) and `fenics-adjoint`
   (`dolfin-adjoint`), plus `numpy`, `scipy`, `matplotlib`, `vtk`.
-- **2D-BFS-GPU:** the above (FEniCS / dolfin-adjoint **2019.1**) plus `torch` with CUDA and
-  `nvidia-cudss-cu12`; an NVIDIA GPU with a CUDA-12 driver. See
-  [2D-BFS-GPU/README.md](2D-BFS-GPU/README.md#requirements).
+- **2D-BFS-GPU:** DOLFINx 0.10 and cuDOLFINx 0.10 with the patch in `2D-BFS-GPU/cudolfinx/`
+  (built inside the official cuDOLFINx container), `pyadjoint`, NVIDIA cuDSS; an NVIDIA GPU.
+  See [2D-BFS-GPU/README.md](2D-BFS-GPU/README.md).
 
 ## Quick start
 
@@ -87,7 +84,8 @@ python Diff_Physics.py    # adjoint inverse (needs FEniCS)
 
 # 2-D backward-facing step, adjoint inverse on the GPU (reads ../2D-BFS/Results_BFS/)
 cd ../2D-BFS-GPU
-OPTIMIZER=adam ITERS=200 python Diff_Physics_GPU.py
+source cudolfinx-build/env.sh     # after cudolfinx/build.sh, see 2D-BFS-GPU/README.md
+python3 Diff_Physics_GPU.py
 
 # 3-D coronary artery
 cd "Coronary Artery"
