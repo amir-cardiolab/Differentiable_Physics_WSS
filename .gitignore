@@ -20,6 +20,18 @@ venv/
 2D-BFS/Runs/
 2D-BFS/Inverse_Results_*/
 
+# 2D-BFS-GPU
+2D-BFS-GPU/Results_BFS/
+2D-BFS-GPU/Results_BFS_InletBC_small/
+2D-BFS-GPU/Inverse_Results_*/
+2D-BFS-GPU/bench_*/
+2D-BFS-GPU/logs/
+2D-BFS-GPU/runs/
+2D-BFS-GPU/gpu_timed_run/results_*/
+2D-BFS-GPU/check_data/out/
+2D-BFS-GPU/check_data/*.vtk
+2D-BFS-GPU/check_data/*.csv
+
 # Coronary Artery PINN outputs
 Coronary Artery/WEIGHTS_pre/
 Coronary Artery/Loss_pre/
