@@ -6,8 +6,8 @@ float64 CSR systems whose sparsity pattern never changes:
     values.copy_(new_values); s.factorize() # numeric factorization on the GPU
     x = s.solve(b)
 
-The library comes from the pip wheel `nvidia-cudss-cu12` (installed by
-cluster/setup_env.sbatch). nvmath-python would wrap this, but its cuDSS support
+The library comes from the pip wheel `nvidia-cudss-cu12` (see the README's
+Requirements). nvmath-python would wrap this, but its cuDSS support
 needs Python >= 3.10 and FEniCS 2019 pins us to 3.9.
 """
 from __future__ import print_function

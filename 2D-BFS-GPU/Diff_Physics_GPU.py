@@ -43,8 +43,8 @@ OPTIMIZER=adam             the original hand-written Adam loop (lr 1.0, 8 step
                            stalls at J ≈ 4.5e-4 with a 17 % flow-rate error,
                            while the true inlet has J ≈ 8e-5.
 
-Usage (on a GPU node, env from cluster/setup_env.sbatch)
---------------------------------------------------------
+Usage (on a GPU machine, env as in the README's Requirements)
+-------------------------------------------------------------
     python Diff_Physics_GPU.py                          # L-BFGS-B, 300 iterations
     OPTIMIZER=adam ITERS=200 python Diff_Physics_GPU.py # original Adam loop
     ITERS=5 FINAL_IDX=200 python Diff_Physics_GPU.py    # quick smoke test

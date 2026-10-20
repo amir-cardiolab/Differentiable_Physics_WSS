@@ -44,7 +44,7 @@ see [Data](#data) below.
 │   ├── gpu_ns.py, gpu_ade.py     # GPU Navier–Stokes / advection–diffusion + their adjoints
 │   ├── gpu_fem.py, gpu_cudss.py  # GPU assembly tables, cuDSS binding
 │   ├── verify_gradient.py, validate_gpu.py, check_data/   # checks against the CPU code
-│   └── gpu_timed_run/, cluster/  # timed run, SLURM scripts
+│   └── gpu_timed_run/            # timed run with pre-flight checks
 └── Coronary Artery/              # 3-D coronary-artery case
     ├── PINNs.py                  # PINN reconstruction
     ├── Diff_Physics.py           # adjoint/differentiable-physics inverse (FEniCS)

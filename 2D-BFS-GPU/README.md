@@ -23,7 +23,6 @@ loop is kept as `OPTIMIZER=adam`. See [Optimiser](#optimiser-adam-vs-l-bfgs-b) f
 | [`check_data/`](check_data/) | data-consistency and CPU-vs-GPU checks at the final control |
 | [`Diff_Physics_CPU_reference.py`](Diff_Physics_CPU_reference.py) | unmodified copy of [`../2D-BFS/Diff_Physics.py`](../2D-BFS/Diff_Physics.py) (timing baseline) |
 | [`bfs_data.py`](bfs_data.py) | finds the input data folder (see [Data](#data)) |
-| [`cluster/`](cluster/) | SLURM scripts (env build + activation, GPU/CPU runs, post-processing) |
 
 ## Data
 
@@ -38,7 +37,7 @@ bundle next to `2D-BFS/` serves both.
 * NVIDIA GPU (≥ 2 GB free memory), driver supporting CUDA 12 (≥ 525).
 * FEniCS **2019.1** + dolfin-adjoint **2019.1**, PyTorch with CUDA, and NVIDIA cuDSS
   (`pip install nvidia-cudss-cu12`), plus `numpy<1.24`, `scipy`, `matplotlib`, `vtk`.
-  Recipe: [`cluster/setup_env.sbatch`](cluster/setup_env.sbatch) (conda, works on a workstation too):
+  With conda:
 
   ```bash
   conda create -n fenics_gpu -c conda-forge python=3.9 fenics=2019.1.0 "numpy<1.24" scipy matplotlib vtk
@@ -154,26 +153,7 @@ regulariser, not the data, decides the profile (it flattens the peak), so the
 flow-rate error creeps from 0.3 % back up to 1.6 %. That is the objective's own
 bias; a smaller `gamma_reg` or stopping earlier trades it off.
 
-## Running on a SLURM cluster
-
-The scripts in [`cluster/`](cluster/) keep the environment as **one tarball**
-(`$BFS_SCRATCH/envs/fenics_gpu.tar.gz`, default `$HOME`) that every job unpacks to node-local
-disk ([`cluster/activate_env.sh`](cluster/activate_env.sh)): fast imports, and safe on scratch
-file systems that purge files by age. Pass your account and partition to `sbatch`; job logs go
-to `logs/`.
-
-```bash
-cd 2D-BFS-GPU && mkdir -p logs
-export BFS_SCRATCH=/path/to/your/scratch                     # optional, default $HOME
-
-sbatch -A <account> -p <cpu-partition> cluster/setup_env.sbatch          # once, ~30-45 min
-sbatch -A <account> -p <gpu-partition> --export=ALL,SCRIPT=verify_gradient.py,N=20 cluster/run_gpu.sbatch
-sbatch -A <account> -p <gpu-partition> cluster/run_gpu.sbatch            # L-BFGS-B, 300 iterations
-sbatch -A <account> -p <gpu-partition> --export=ALL,OPTIMIZER=adam,ITERS=200 cluster/run_gpu.sbatch
-sbatch -A <account> -p <cpu-partition> cluster/postprocess.sbatch Inverse_Results_GPU_lbfgs_... Inverse_Results_GPU_adam_...
-# CPU baseline: the original script (any FEniCS 2019 + dolfin-adjoint env, ENV=<conda env name>)
-sbatch -A <account> -p <cpu-partition> --export=ALL,N=4000,ENV=fenics_gpu cluster/bench_cpu_reference.sbatch
-```
+## Settings
 
 Settings: the config block at the top of `Diff_Physics_GPU.py`; the env vars
 `OPTIMIZER` (lbfgs|adam), `ITERS`, `FINAL_IDX`, `DEVICE`, `OUT_DIR` override it.
